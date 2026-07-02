@@ -74,7 +74,11 @@ impl App {
                 decorations: true,
                 level: window::Level::AlwaysOnTop,
                 position: window::Position::Centered,
-                exit_on_close_request: false,
+                // Let the titlebar ✕ close (hide) the widget window. In daemon
+                // mode this only closes the window — the process, tray, and
+                // reminders keep running — and `close_events()` clears
+                // `self.widget` so the tray toggle reopens it.
+                exit_on_close_request: true,
                 ..window::Settings::default()
             };
             let (id, open) = window::open(settings);

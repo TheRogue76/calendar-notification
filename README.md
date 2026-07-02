@@ -73,7 +73,8 @@ A calendar icon appears in the tray. Its menu:
 - **Calendars** — per-calendar **Visible in agenda** / **Notify** toggles.
 - **Quit**.
 
-Closing the widget window keeps the daemon (tray + reminders) running.
+Closing the widget with its titlebar **✕** just hides it — the daemon (tray +
+reminders) keeps running, and **Show / hide widget** reopens it.
 
 ## Autostart on login (systemd user service)
 
@@ -112,12 +113,20 @@ panic and you'll see the backtrace (set `RUST_BACKTRACE=1` for detail).
 
 ## How reminders work
 
-On each sync the app fetches occurrences for the next 48 hours (recurring events
-expanded server-side via Google's `singleEvents`, so timezone/DST/EXDATE edge
-cases are handled by Google). For every occurrence on a **notify-enabled**
-calendar it schedules that occurrence's `popup` reminders (event overrides, or
-the calendar's default reminders) and fires a desktop notification at each lead
-time. Already-fired reminders are de-duplicated so restarts don't re-notify.
+On each sync the app fetches occurrences from the start of today through the
+next 48 hours (recurring events expanded server-side via Google's
+`singleEvents`, so timezone/DST/EXDATE edge cases are handled by Google). The
+agenda shows today's events; reminders can fire for anything in the window. For
+every occurrence on a **notify-enabled** calendar it schedules that occurrence's
+`popup` reminders (event overrides, or the calendar's default reminders) and
+fires a desktop notification at each lead time.
+
+Already-fired reminders are de-duplicated **within a run** (an in-memory set
+keyed by occurrence + lead time). This set is not persisted, so it's empty after
+a restart; what prevents a flood of stale notifications on startup is a separate
+guard that skips any reminder whose fire time is already more than a few minutes
+in the past. (A reminder that fired moments before a restart could therefore
+fire once more.)
 
 ## Notes / limitations
 
