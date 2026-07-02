@@ -1,6 +1,6 @@
 [Unit]
 Description=Calendar Notification — Google Calendar tray reminders + agenda widget
-Documentation=https://github.com/your/repo
+Documentation=https://github.com/TheRogue76/calendar-notification
 # Wait for the graphical session so the tray and notifications have a bus.
 After=graphical-session.target
 PartOf=graphical-session.target

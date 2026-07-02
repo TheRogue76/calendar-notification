@@ -50,11 +50,17 @@ impl GoogleClient {
         let mut out = Vec::new();
         for entry in list.items.unwrap_or_default() {
             let Some(id) = entry.id else { continue };
+            // Skip stale/removed subscriptions that Google keeps in the list.
+            if entry.deleted == Some(true) {
+                tracing::debug!("skipping deleted calendar {id}");
+                continue;
+            }
             // Only calendars we can actually read events from. `freeBusyReader`
             // and `none` calendars appear in the list but return 404 on
             // events.list, so drop them to avoid noise.
             let access = entry.access_role.as_deref().unwrap_or("reader");
             if !matches!(access, "reader" | "writer" | "owner") {
+                tracing::debug!("skipping calendar {id} (access_role={access})");
                 continue;
             }
             out.push(Calendar {
@@ -76,7 +82,7 @@ impl GoogleClient {
         time_min: DateTime<Utc>,
         time_max: DateTime<Utc>,
     ) -> Result<Vec<Occurrence>> {
-        let (_resp, events) = self
+        let result = self
             .hub
             .events()
             .list(&encode_calendar_id(calendar_id))
@@ -85,8 +91,23 @@ impl GoogleClient {
             .single_events(true)
             .order_by("startTime")
             .doit()
-            .await
-            .with_context(|| format!("listing events for {calendar_id}"))?;
+            .await;
+
+        let (_resp, events) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                // A 404 means the calendar is in the list but isn't queryable
+                // (stale/removed subscription). Skip it quietly rather than
+                // spamming a warning every sync; propagate everything else.
+                let msg = e.to_string();
+                if msg.contains("notFound") || msg.contains("\"code\":404") {
+                    tracing::debug!("skipping unreadable calendar {calendar_id}: {msg}");
+                    return Ok(Vec::new());
+                }
+                return Err(anyhow::Error::new(e))
+                    .with_context(|| format!("listing events for {calendar_id}"));
+            }
+        };
 
         let calendar_defaults = reminder_rules(events.default_reminders.as_deref());
 

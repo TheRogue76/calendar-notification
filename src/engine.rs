@@ -228,13 +228,13 @@ impl Engine {
         best
     }
 
-    fn fire_reminder(&mut self, idx: usize, minutes: i64, key: String) {
+    async fn fire_reminder(&mut self, idx: usize, minutes: i64, key: String) {
         if let Some(occ) = self.occurrences.get(idx) {
             info!(
                 "firing reminder for '{}' ({} min before)",
                 occ.title, minutes
             );
-            if let Err(e) = notify::show_reminder(occ, minutes) {
+            if let Err(e) = notify::show_reminder(occ, minutes).await {
                 error!("notification failed: {e:#}");
             }
         }
@@ -332,7 +332,7 @@ pub async fn run(
             }
             _ = async { sleep.unwrap().await }, if next.is_some() => {
                 let (_, idx, minutes, key) = next.unwrap();
-                engine.fire_reminder(idx, minutes, key);
+                engine.fire_reminder(idx, minutes, key).await;
             }
         }
     }

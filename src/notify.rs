@@ -10,7 +10,11 @@ use crate::google::model::Occurrence;
 ///
 /// `minutes_before` is the lead time of the reminder rule that fired, used to
 /// phrase the summary ("in 10 minutes").
-pub fn show_reminder(occ: &Occurrence, minutes_before: i64) -> Result<()> {
+///
+/// Uses the async (`show_async`) API: the synchronous `show()` internally spins
+/// up a blocking zbus runtime, which panics ("Cannot start a runtime from
+/// within a runtime") when called from inside the engine's tokio loop.
+pub async fn show_reminder(occ: &Occurrence, minutes_before: i64) -> Result<()> {
     let when = lead_phrase(minutes_before);
     let summary = format!("{} — {when}", occ.title);
 
@@ -31,7 +35,8 @@ pub fn show_reminder(occ: &Occurrence, minutes_before: i64) -> Result<()> {
         .icon("x-office-calendar")
         .appname("Calendar")
         .timeout(notify_rust::Timeout::Milliseconds(10_000))
-        .show()?;
+        .show_async()
+        .await?;
 
     Ok(())
 }
