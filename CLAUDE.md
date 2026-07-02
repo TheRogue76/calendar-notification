@@ -9,6 +9,12 @@ Google Calendar reminder daemon plus an on-demand agenda / add-event widget.
 User-facing docs live in `README.md` (build, OAuth setup, autostart). This file
 is the engineering map.
 
+**Idiomatic-Rust skills** live in `.claude/skills/`: `idiomatic-rust` (naming,
+error handling, traits/async, API design — with the Rust API + Microsoft
+Pragmatic guidelines as reference files) and `rust-testing` (test patterns + the
+≥80% coverage gate). This file owns *architecture*; those skills own *how the
+code is written*. Consult them when writing or reviewing Rust here.
+
 ## Architecture
 
 **Two execution contexts in one process:**
