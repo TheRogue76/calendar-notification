@@ -11,11 +11,16 @@ use crate::engine::CalendarView;
 use crate::google::model::EventDetails;
 use crate::ui::agenda::{format_when, parse_hex};
 
-pub fn view<'a>(detail: &'a DetailState, calendars: &'a [CalendarView]) -> Element<'a, Message> {
-    let (title, edit_enabled): (&str, bool) = match detail {
-        DetailState::Loading { title } => (title, false),
-        DetailState::Loaded(d) => (&d.title, true),
-        DetailState::Failed { title, .. } => (title, false),
+pub fn view<'a>(
+    detail: &'a DetailState,
+    calendars: &'a [CalendarView],
+    delete_prompt: bool,
+    selected_instance: Option<&'a str>,
+) -> Element<'a, Message> {
+    let title: &str = match detail {
+        DetailState::Loading { title } => title,
+        DetailState::Loaded(d) => &d.title,
+        DetailState::Failed { title, .. } => title,
     };
 
     let mut header = row![
@@ -24,8 +29,11 @@ pub fn view<'a>(detail: &'a DetailState, calendars: &'a [CalendarView]) -> Eleme
     ]
     .align_y(Alignment::Center)
     .spacing(8);
-    if edit_enabled {
-        header = header.push(button("✎ Edit").on_press(Message::EditSelected));
+    // Edit + delete actions are only offered once the full event has loaded.
+    if let DetailState::Loaded(d) = detail {
+        for action in header_actions(d, delete_prompt, selected_instance) {
+            header = header.push(action);
+        }
     }
 
     let body = match detail {
@@ -46,6 +54,62 @@ pub fn view<'a>(detail: &'a DetailState, calendars: &'a [CalendarView]) -> Eleme
         .padding(12)
         .height(Length::Fill)
         .into()
+}
+
+/// The header's right-side buttons for a loaded event. Normally `Edit` + a
+/// `Delete` that expands (inline, no modal) into a confirmation: a single
+/// `Confirm delete` for one-off events, or a `this event` / `all events` choice
+/// for recurring ones (the scope choice doubles as the confirmation).
+fn header_actions<'a>(
+    d: &'a EventDetails,
+    delete_prompt: bool,
+    selected_instance: Option<&'a str>,
+) -> Vec<Element<'a, Message>> {
+    if !delete_prompt {
+        return vec![
+            button("✎ Edit").on_press(Message::EditSelected).into(),
+            button("🗑 Delete")
+                .on_press(Message::RequestDelete)
+                .style(button::danger)
+                .into(),
+        ];
+    }
+
+    let cancel = button("Cancel").on_press(Message::CancelDelete).into();
+
+    if d.recurrence.is_empty() {
+        vec![
+            button("⚠ Confirm delete")
+                .on_press(Message::ConfirmDelete {
+                    calendar_id: d.calendar_id.clone(),
+                    event_id: d.event_id.clone(),
+                })
+                .style(button::danger)
+                .into(),
+            cancel,
+        ]
+    } else {
+        // "this event" needs the per-instance id; fall back to the series master
+        // if it's somehow absent. "all events" targets the master.
+        let instance_id = selected_instance.unwrap_or(&d.event_id).to_string();
+        vec![
+            button("Delete this event")
+                .on_press(Message::ConfirmDelete {
+                    calendar_id: d.calendar_id.clone(),
+                    event_id: instance_id,
+                })
+                .style(button::danger)
+                .into(),
+            button("Delete all events")
+                .on_press(Message::ConfirmDelete {
+                    calendar_id: d.calendar_id.clone(),
+                    event_id: d.event_id.clone(),
+                })
+                .style(button::danger)
+                .into(),
+            cancel,
+        ]
+    }
 }
 
 fn loaded_body<'a>(
@@ -136,15 +200,51 @@ mod tests {
 
     #[test]
     fn view_builds_in_every_state() {
-        let _ = view(&DetailState::Loading { title: "T".into() }, &cals());
-        let _ = view(&DetailState::Loaded(details()), &cals());
+        let _ = view(
+            &DetailState::Loading { title: "T".into() },
+            &cals(),
+            false,
+            None,
+        );
+        let _ = view(&DetailState::Loaded(details()), &cals(), false, None);
         let _ = view(
             &DetailState::Failed {
                 title: "T".into(),
                 message: "boom".into(),
             },
             &cals(),
+            false,
+            None,
         );
+    }
+
+    #[test]
+    fn view_builds_delete_confirmation_states() {
+        // One-off event: single confirm button.
+        let _ = view(&DetailState::Loaded(details()), &cals(), true, Some("inst"));
+
+        // Recurring event: this-event / all-events scope choice.
+        let mut d = details();
+        d.recurrence = vec!["RRULE:FREQ=DAILY".into()];
+        let _ = view(&DetailState::Loaded(d), &cals(), true, Some("inst-123"));
+
+        // Recurring but no instance id available: falls back to the master.
+        let mut d = details();
+        d.recurrence = vec!["RRULE:FREQ=DAILY".into()];
+        let _ = view(&DetailState::Loaded(d), &cals(), true, None);
+    }
+
+    #[test]
+    fn header_actions_switch_on_prompt_and_recurrence() {
+        let mut one_off = details();
+        one_off.recurrence = vec![];
+        assert_eq!(header_actions(&one_off, false, None).len(), 2); // Edit + Delete
+        assert_eq!(header_actions(&one_off, true, None).len(), 2); // Confirm + Cancel
+
+        let recurring = details(); // details() carries an RRULE
+        assert!(!recurring.recurrence.is_empty());
+        // this event + all events + cancel
+        assert_eq!(header_actions(&recurring, true, Some("inst")).len(), 3);
     }
 
     #[test]
@@ -164,6 +264,6 @@ mod tests {
             attendees: vec![],
             recurrence: vec![],
         };
-        let _ = view(&DetailState::Loaded(d), &cals());
+        let _ = view(&DetailState::Loaded(d), &cals(), false, None);
     }
 }

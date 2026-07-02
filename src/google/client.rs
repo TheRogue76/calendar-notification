@@ -166,6 +166,20 @@ impl crate::engine::CalendarSource for GoogleClient {
             .context("updating event")?;
         Ok(updated.id.unwrap_or_default())
     }
+
+    /// Delete an event. `event_id` may be a single expanded instance (cancels
+    /// that occurrence) or the series master (removes the whole series). Unlike
+    /// insert/patch/get, `delete().doit()` yields only a `Response` (empty body),
+    /// so there's nothing to destructure.
+    async fn delete_event(&self, calendar_id: &str, event_id: &str) -> Result<()> {
+        self.hub
+            .events()
+            .delete(&encode_calendar_id(calendar_id), event_id)
+            .doit()
+            .await
+            .with_context(|| format!("deleting event {event_id}"))?;
+        Ok(())
+    }
 }
 
 /// Percent-encode the characters that would otherwise break the request URL.
