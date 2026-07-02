@@ -9,7 +9,6 @@
 use std::sync::{Mutex, OnceLock};
 
 use iced::futures::{SinkExt, Stream};
-use iced::widget::text;
 use iced::{window, Element, Size, Subscription, Task, Theme};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -212,12 +211,6 @@ fn engine_events() -> impl Stream<Item = Message> {
             }
         },
     )
-}
-
-// A tiny helper so the module has a place to surface build errors during dev.
-#[allow(dead_code)]
-fn _assert_element(app: &App) -> Element<'_, Message> {
-    text(app.status.clone()).into()
 }
 
 #[cfg(test)]

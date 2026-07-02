@@ -76,13 +76,21 @@ impl Config {
     }
 
     /// Merge in a freshly discovered calendar without clobbering existing prefs.
-    pub fn ensure_calendar(&mut self, id: &str, color: &str) {
-        self.calendars
-            .entry(id.to_string())
-            .or_insert_with(|| CalendarPrefs {
-                color: color.to_string(),
-                ..Default::default()
-            });
+    ///
+    /// Returns `true` if a new entry was inserted (so the caller can skip a
+    /// disk write when nothing changed).
+    pub fn ensure_calendar(&mut self, id: &str, color: &str) -> bool {
+        use std::collections::btree_map::Entry;
+        match self.calendars.entry(id.to_string()) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(slot) => {
+                slot.insert(CalendarPrefs {
+                    color: color.to_string(),
+                    ..Default::default()
+                });
+                true
+            }
+        }
     }
 
     /// Load config from disk, creating a default file on first run.
@@ -118,7 +126,8 @@ impl Config {
     /// Persist to a specific path — the testable core of [`Config::save`].
     pub fn save_to(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating config dir {}", parent.display()))?;
         }
         let text = toml::to_string_pretty(self).context("serializing config")?;
         std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
@@ -168,10 +177,17 @@ mod tests {
     #[test]
     fn ensure_calendar_inserts_once_and_preserves_prefs() {
         let mut cfg = Config::default();
-        cfg.ensure_calendar("cal-1", "#ff0000");
+        assert!(
+            cfg.ensure_calendar("cal-1", "#ff0000"),
+            "first insert is new"
+        );
         cfg.calendars.get_mut("cal-1").unwrap().visible = false;
-        // Re-ensuring must not clobber the user's changed pref.
-        cfg.ensure_calendar("cal-1", "#00ff00");
+        // Re-ensuring must not clobber the user's changed pref, and reports
+        // that nothing was inserted.
+        assert!(
+            !cfg.ensure_calendar("cal-1", "#00ff00"),
+            "re-ensure is a no-op"
+        );
         let prefs = &cfg.calendars["cal-1"];
         assert!(!prefs.visible);
         assert_eq!(prefs.color, "#ff0000");

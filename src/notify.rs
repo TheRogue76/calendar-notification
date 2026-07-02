@@ -2,7 +2,6 @@
 //! `org.freedesktop.Notifications` via pure-Rust zbus).
 
 use anyhow::Result;
-use chrono::Local;
 
 use crate::google::model::Occurrence;
 
@@ -21,7 +20,7 @@ pub async fn show_reminder(occ: &Occurrence, minutes_before: i64) -> Result<()> 
     let mut body = if occ.all_day {
         "All day".to_string()
     } else {
-        format!("{}", occ.start.with_timezone(&Local).format("%H:%M"))
+        occ.start.format("%H:%M").to_string()
     };
     if let Some(loc) = &occ.location {
         if !loc.is_empty() {
