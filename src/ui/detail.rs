@@ -221,7 +221,9 @@ mod tests {
     #[test]
     fn view_builds_delete_confirmation_states() {
         // One-off event: single confirm button.
-        let _ = view(&DetailState::Loaded(details()), &cals(), true, Some("inst"));
+        let mut d = details();
+        d.recurrence = vec![];
+        let _ = view(&DetailState::Loaded(d), &cals(), true, Some("inst"));
 
         // Recurring event: this-event / all-events scope choice.
         let mut d = details();
