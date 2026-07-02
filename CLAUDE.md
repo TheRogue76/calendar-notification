@@ -129,6 +129,11 @@ genuinely not unit-testable (needs live GUI/network/D-Bus/OAuth — see the
 "Intentionally uncovered" list below), say so explicitly rather than skipping
 silently; don't pad coverage with brittle mocks of those layers.
 
+**CI enforces this**: `.github/workflows/ci.yml` runs fmt/clippy/test on every
+PR, and uploads coverage to Codecov. Codecov's **patch** status (config in
+`codecov.yml`) fails when a PR's changed lines are <80% covered — so shipping
+untested new code shows up as a red check + comment on the PR.
+
 - **Unit tests** live in each module under `#[cfg(test)] mod tests` (they can
   reach private fns — that's where most coverage comes from). **Integration
   tests** in `tests/integration.rs` exercise the public API as an external
