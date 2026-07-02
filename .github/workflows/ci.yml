@@ -17,7 +17,7 @@ jobs:
     name: Test & lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -43,7 +43,7 @@ jobs:
     name: Coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust (stable + llvm-tools)
         uses: dtolnay/rust-toolchain@stable
@@ -59,7 +59,7 @@ jobs:
         run: cargo llvm-cov --all-features --workspace --codecov --output-path codecov.json
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: codecov.json
