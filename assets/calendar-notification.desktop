@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=Calendar Notification
+GenericName=Calendar Reminders
+Comment=Google Calendar tray reminders and agenda widget
+Exec=calendar-notification
+Icon=calendar-notification
+Terminal=false
+Categories=Office;Calendar;Utility;
+Keywords=calendar;google;reminder;agenda;
+# Must equal the window application_id set in src/app.rs so GNOME/Wayland
+# matches the widget window to this entry and shows the icon below (rather than
+# a generic fallback) in the dock.
+StartupWMClass=calendar-notification
+X-GNOME-UsesNotifications=true
