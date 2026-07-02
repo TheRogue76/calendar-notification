@@ -159,13 +159,9 @@ impl Tray for CalTray {
 /// [`Icon`]: ARGB32 in network byte order (A, R, G, B), vs. the shared drawing's
 /// RGBA. Same glyph as the widget's window icon, so tray and dock stay in sync.
 fn calendar_icon(size: u32) -> Icon {
-    let rgba = crate::icon::calendar_rgba(size);
-    let mut data = vec![0u8; rgba.len()];
-    for (dst, src) in data.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
-        dst[0] = src[3]; // A
-        dst[1] = src[0]; // R
-        dst[2] = src[1]; // G
-        dst[3] = src[2]; // B
+    let mut data = crate::icon::calendar_rgba(size);
+    for px in data.chunks_exact_mut(4) {
+        px.rotate_right(1); // RGBA -> ARGB (A, R, G, B)
     }
     Icon {
         width: size as i32,
