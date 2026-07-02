@@ -13,7 +13,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 
 use super::auth::Auth;
-use super::model::{Calendar, NewEvent, Occurrence, ReminderRule};
+use super::model::{Calendar, EventDetails, NewEvent, Occurrence, ReminderRule};
 
 type Hub = CalendarHub<HttpsConnector<HttpConnector>>;
 
@@ -134,6 +134,38 @@ impl crate::engine::CalendarSource for GoogleClient {
             .context("inserting event")?;
         Ok(created.id.unwrap_or_default())
     }
+
+    /// Fetch a single event (the series master for a recurring event) with the
+    /// fields the detail pane and edit form need.
+    async fn get_event(&self, calendar_id: &str, event_id: &str) -> Result<EventDetails> {
+        let (_resp, ev) = self
+            .hub
+            .events()
+            .get(&encode_calendar_id(calendar_id), event_id)
+            .doit()
+            .await
+            .with_context(|| format!("getting event {event_id}"))?;
+        to_event_details(calendar_id, event_id, ev)
+    }
+
+    /// Patch an existing event (whole series for a recurring event); returns the
+    /// event id.
+    async fn update_event(
+        &self,
+        calendar_id: &str,
+        event_id: &str,
+        ev: &NewEvent,
+    ) -> Result<String> {
+        let event = build_patch(ev);
+        let (_resp, updated) = self
+            .hub
+            .events()
+            .patch(event, &encode_calendar_id(calendar_id), event_id)
+            .doit()
+            .await
+            .context("updating event")?;
+        Ok(updated.id.unwrap_or_default())
+    }
 }
 
 /// Percent-encode the characters that would otherwise break the request URL.
@@ -171,6 +203,7 @@ fn to_occurrence(
     calendar_defaults: &[ReminderRule],
 ) -> Option<Occurrence> {
     let event_id = ev.id.clone()?;
+    let recurring_event_id = ev.recurring_event_id.clone();
     let (start_dt, all_day) = parse_start(ev.start.as_ref())?;
     let end_dt = parse_end(ev.end.as_ref()).unwrap_or(start_dt);
 
@@ -192,6 +225,7 @@ fn to_occurrence(
 
     Some(Occurrence {
         event_id,
+        recurring_event_id,
         calendar_id: calendar_id.to_string(),
         title: ev.summary.unwrap_or_else(|| "(no title)".to_string()),
         location: ev.location,
@@ -229,8 +263,10 @@ fn parse_end(edt: Option<&EventDateTime>) -> Option<DateTime<Local>> {
     }
 }
 
-fn build_event(new: &NewEvent) -> Event {
-    let (start, end) = if new.all_day {
+/// Start/end `EventDateTime`s for an event: all-day events carry dates (with an
+/// exclusive end, per Google), timed events carry UTC instants.
+fn event_times(new: &NewEvent) -> (EventDateTime, EventDateTime) {
+    if new.all_day {
         let start_date = new.start.date_naive();
         // Google's all-day end date is exclusive; ensure it's after start.
         let mut end_date = new.end.date_naive();
@@ -262,9 +298,12 @@ fn build_event(new: &NewEvent) -> Event {
                 time_zone: None,
             },
         )
-    };
+    }
+}
 
-    let attendees = if new.attendees.is_empty() {
+/// Attendee list for the API, or `None` when there are no guests.
+fn event_attendees(new: &NewEvent) -> Option<Vec<EventAttendee>> {
+    if new.attendees.is_empty() {
         None
     } else {
         Some(
@@ -276,7 +315,11 @@ fn build_event(new: &NewEvent) -> Event {
                 })
                 .collect(),
         )
-    };
+    }
+}
+
+fn build_event(new: &NewEvent) -> Event {
+    let (start, end) = event_times(new);
 
     let recurrence = if new.recurrence.is_empty() {
         None
@@ -290,11 +333,53 @@ fn build_event(new: &NewEvent) -> Event {
         description: new.description.clone(),
         start: Some(start),
         end: Some(end),
-        attendees,
+        attendees: event_attendees(new),
         recurrence,
         // Leave reminders on useDefault so the calendar's defaults apply.
         ..Default::default()
     }
+}
+
+/// Build the `Event` for a PATCH update. Two differences from [`build_event`]:
+/// blank `location`/`description` are sent as `Some("")` so they can be cleared
+/// (PATCH ignores fields left as `None`), and `recurrence`/`reminders` are
+/// omitted entirely so the existing series RRULE and reminder overrides are
+/// preserved (the edit form doesn't expose them).
+fn build_patch(new: &NewEvent) -> Event {
+    let (start, end) = event_times(new);
+    Event {
+        summary: Some(new.title.clone()),
+        location: Some(new.location.clone().unwrap_or_default()),
+        description: Some(new.description.clone().unwrap_or_default()),
+        start: Some(start),
+        end: Some(end),
+        attendees: event_attendees(new),
+        ..Default::default()
+    }
+}
+
+/// Convert a fully-fetched `Event` into our [`EventDetails`] domain type.
+fn to_event_details(calendar_id: &str, event_id: &str, ev: Event) -> Result<EventDetails> {
+    let (start, all_day) = parse_start(ev.start.as_ref()).context("event has no start time")?;
+    let end = parse_end(ev.end.as_ref()).unwrap_or(start);
+    let attendees = ev
+        .attendees
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|a| a.email)
+        .collect();
+    Ok(EventDetails {
+        calendar_id: calendar_id.to_string(),
+        event_id: event_id.to_string(),
+        title: ev.summary.unwrap_or_else(|| "(no title)".to_string()),
+        location: ev.location,
+        description: ev.description,
+        all_day,
+        start,
+        end,
+        attendees,
+        recurrence: ev.recurrence.unwrap_or_default(),
+    })
 }
 
 #[cfg(test)]
@@ -540,5 +625,65 @@ mod tests {
         assert_eq!(att.len(), 2);
         assert_eq!(att[0].email.as_deref(), Some("a@x.com"));
         assert_eq!(ev.recurrence.unwrap(), vec!["RRULE:FREQ=DAILY".to_string()]);
+    }
+
+    // -- build_patch ---------------------------------------------------------
+
+    #[test]
+    fn build_patch_sends_blank_fields_as_empty_to_clear_them() {
+        let mut n = base_new();
+        n.location = None;
+        n.description = None;
+        let ev = build_patch(&n);
+        // Some("") lets PATCH clear the field; None would leave it unchanged.
+        assert_eq!(ev.location.as_deref(), Some(""));
+        assert_eq!(ev.description.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn build_patch_omits_recurrence_and_reminders_to_preserve_them() {
+        let mut n = base_new();
+        n.recurrence = vec!["RRULE:FREQ=DAILY".into()];
+        let ev = build_patch(&n);
+        // Left as None so the existing series RRULE / reminder overrides survive.
+        assert!(ev.recurrence.is_none());
+        assert!(ev.reminders.is_none());
+        assert_eq!(ev.summary.as_deref(), Some("Title"));
+    }
+
+    // -- to_event_details ----------------------------------------------------
+
+    #[test]
+    fn to_event_details_maps_timed_event_with_guests_and_recurrence() {
+        let mut ev = timed_event(Some("master"));
+        ev.description = Some("notes".into());
+        ev.recurrence = Some(vec!["RRULE:FREQ=WEEKLY".into()]);
+        ev.attendees = Some(vec![
+            EventAttendee {
+                email: Some("a@x.com".into()),
+                ..Default::default()
+            },
+            EventAttendee {
+                email: None, // dropped
+                ..Default::default()
+            },
+        ]);
+        let d = to_event_details("cal", "master", ev).unwrap();
+        assert_eq!(d.calendar_id, "cal");
+        assert_eq!(d.event_id, "master");
+        assert_eq!(d.title, "Meeting");
+        assert!(!d.all_day);
+        assert_eq!(d.description.as_deref(), Some("notes"));
+        assert_eq!(d.attendees, vec!["a@x.com".to_string()]);
+        assert_eq!(d.recurrence, vec!["RRULE:FREQ=WEEKLY".to_string()]);
+    }
+
+    #[test]
+    fn to_event_details_errors_without_start() {
+        let ev = Event {
+            id: Some("e".into()),
+            ..Default::default()
+        };
+        assert!(to_event_details("cal", "e", ev).is_err());
     }
 }

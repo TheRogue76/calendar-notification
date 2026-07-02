@@ -1,7 +1,7 @@
 //! The "today at a glance" agenda: a header with sync/add controls, per-calendar
 //! visibility chips, and a scrollable, color-coded list of today's events.
 
-use chrono::Local;
+use chrono::{DateTime, Local};
 use iced::widget::{button, checkbox, column, container, row, scrollable, text, Space};
 use iced::{Alignment, Color, Element, Length};
 
@@ -18,7 +18,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     .spacing(8);
 
     // Per-calendar visibility chips.
-    let mut chips = row![].spacing(8);
+    let mut chips = row![].spacing(10);
     for cal in &app.calendars {
         let id = cal.id.clone();
         chips = chips.push(
@@ -37,7 +37,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         .map(|c| c.id.as_str())
         .collect();
 
-    let mut list = column![].spacing(6);
+    let mut list = column![].spacing(12);
     let mut count = 0;
     for occ in &app.occurrences {
         if occ.start.date_naive() != today {
@@ -62,10 +62,22 @@ pub fn view(app: &App) -> Element<'_, Message> {
         scrollable(list).height(Length::Fill),
         row![iced::widget::space::horizontal(), add_btn],
     ]
-    .spacing(10)
+    .spacing(14)
     .padding(4);
 
-    container(body).padding(8).height(Length::Fill).into()
+    container(body).padding(12).height(Length::Fill).into()
+}
+
+/// Human-readable time span for an occurrence: "All day", a single time, or a
+/// "HH:MM–HH:MM" range. Shared by the agenda rows and the detail pane.
+pub(crate) fn format_when(start: DateTime<Local>, end: DateTime<Local>, all_day: bool) -> String {
+    if all_day {
+        "All day".to_string()
+    } else if end > start {
+        format!("{}–{}", start.format("%H:%M"), end.format("%H:%M"))
+    } else {
+        start.format("%H:%M").to_string()
+    }
 }
 
 fn event_row<'a>(app: &'a App, occ: &'a Occurrence) -> Element<'a, Message> {
@@ -76,13 +88,7 @@ fn event_row<'a>(app: &'a App, occ: &'a Occurrence) -> Element<'a, Message> {
         .map(|c| parse_hex(&c.color))
         .unwrap_or(Color::from_rgb(0.5, 0.5, 0.5));
 
-    let when = if occ.all_day {
-        "All day".to_string()
-    } else if occ.end > occ.start {
-        format!("{}–{}", occ.start.format("%H:%M"), occ.end.format("%H:%M"))
-    } else {
-        occ.start.format("%H:%M").to_string()
-    };
+    let when = format_when(occ.start, occ.end, occ.all_day);
 
     let dot = container(
         Space::new()
@@ -102,18 +108,30 @@ fn event_row<'a>(app: &'a App, occ: &'a Occurrence) -> Element<'a, Message> {
         }
     }
 
-    row![
+    let content = row![
         text(when).size(13).width(Length::Fixed(96.0)),
         container(dot).center_y(Length::Fixed(20.0)),
         title_col,
     ]
-    .spacing(10)
-    .align_y(Alignment::Center)
-    .into()
+    .spacing(12)
+    .align_y(Alignment::Center);
+
+    // A flat (text-styled) button so the whole row is clickable but still reads
+    // as a list item; selecting it opens the detail pane.
+    button(content)
+        .on_press(Message::SelectEvent {
+            calendar_id: occ.calendar_id.clone(),
+            event_id: occ.edit_target_id().to_string(),
+            title: occ.title.clone(),
+        })
+        .style(button::text)
+        .width(Length::Fill)
+        .padding(2)
+        .into()
 }
 
 /// Parse `#RRGGBB` into an iced Color; falls back to gray.
-fn parse_hex(hex: &str) -> Color {
+pub(crate) fn parse_hex(hex: &str) -> Color {
     let h = hex.trim_start_matches('#');
     // Validate ASCII-hex on the raw bytes *before* the byte-index slices below.
     // `h.len()` counts bytes, so a 6-byte non-ASCII string (e.g. a multi-byte
@@ -165,6 +183,22 @@ mod tests {
     }
 
     #[test]
+    fn format_when_covers_all_day_range_and_instant() {
+        let start = Local::now();
+        assert_eq!(format_when(start, start, true), "All day");
+        let end = start + Duration::hours(1);
+        assert_eq!(
+            format_when(start, end, false),
+            format!("{}–{}", start.format("%H:%M"), end.format("%H:%M"))
+        );
+        // end == start -> single instant
+        assert_eq!(
+            format_when(start, start, false),
+            start.format("%H:%M").to_string()
+        );
+    }
+
+    #[test]
     fn parse_hex_short_or_invalid_is_gray() {
         for bad in ["", "#12", "gggggg", "#12345"] {
             let c = parse_hex(bad);
@@ -187,6 +221,7 @@ mod tests {
         let start = Local::now() + Duration::hours(offset_h);
         Occurrence {
             event_id: "e".into(),
+            recurring_event_id: None,
             calendar_id: cal_id.into(),
             title: "Event".into(),
             location: loc.map(|s| s.into()),
