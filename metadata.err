@@ -1,0 +1,10 @@
+    Updating crates.io index
+error: failed to select a version for `google-calendar3`.
+    ... required by package `calendar-notification v0.1.0 (/home/parsa-nasirimehr/Desktop/calendar-notification)`
+versions that meet the requirements `^7` are: 7.0.0+20251214
+
+package `calendar-notification` depends on `google-calendar3` with feature `rustls-tls` but `google-calendar3` does not have that feature.
+ available features: aws-lc-rs, default, ring, utoipa, yup-oauth2, yup-oauth2-service-account
+
+
+failed to select a version for `google-calendar3` which could resolve this conflict

@@ -1,0 +1,51 @@
+[package]
+name = "calendar-notification"
+version = "0.1.0"
+edition = "2021"
+description = "System-tray Google Calendar reminder daemon + on-screen agenda widget for Ubuntu/GNOME"
+license = "MIT"
+
+[dependencies]
+# GUI (daemon mode: process lives in tray, opens widget window on demand)
+iced = { version = "0.14", features = ["tokio", "advanced"] }
+
+# System tray (StatusNotifierItem) — pure zbus, no GTK/libdbus
+ksni = "0.3"
+
+# Desktop notifications (freedesktop, pure-Rust dbus)
+notify-rust = "4"
+
+# Google Calendar API v3 + OAuth. Default features = [yup-oauth2, ring],
+# i.e. hyper-rustls — no OpenSSL / libssl-dev needed.
+google-calendar3 = "7"
+yup-oauth2 = "12"
+# hyper stack for building the CalendarHub http client
+hyper = "1"
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2"] }
+# default-features=false keeps hyper-rustls from also pulling in aws-lc-rs; we
+# use the `ring` provider only. `native-tokio` keeps `with_native_roots()`.
+hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "native-tokio", "http1", "http2", "tls12", "logging"] }
+http-body-util = "0.1"
+# Pin the process-level rustls crypto provider to `ring` (see main.rs).
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
+# Time (recurrence expansion is done server-side via single_events=true)
+chrono = { version = "0.4", features = ["serde"] }
+
+# Async runtime (shared by ksni, oauth, http)
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+# Config / token XDG paths
+directories = "6"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Errors & logging
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Bridge tokio streams into iced subscriptions
+futures = "0.3"

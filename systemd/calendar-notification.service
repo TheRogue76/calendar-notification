@@ -1,0 +1,17 @@
+[Unit]
+Description=Calendar Notification — Google Calendar tray reminders + agenda widget
+Documentation=https://github.com/your/repo
+# Wait for the graphical session so the tray and notifications have a bus.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/calendar-notification
+Restart=on-failure
+RestartSec=5
+# Give the notification/tray D-Bus services a moment on login.
+Environment=RUST_LOG=calendar_notification=info
+
+[Install]
+WantedBy=default.target

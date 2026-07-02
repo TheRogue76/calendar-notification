@@ -1,0 +1,28 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo — keep Cargo.lock for a binary crate (recommended), so it's NOT ignored.
+# (If this were a library, you'd ignore Cargo.lock here.)
+
+# Backup / editor files
+*~
+*.swp
+*.swo
+.DS_Store
+
+# IDE / editor
+/.idea/
+/.vscode/
+*.iml
+
+# Local OAuth credentials / tokens if ever kept in-tree (they live in XDG dirs
+# by default, but never commit these if you copy them here for testing).
+config.toml
+token.json
+*.client_secret.json
+client_secret*.json
+
+# Logs
+*.log
