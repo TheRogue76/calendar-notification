@@ -1,0 +1,33 @@
+# Codecov configuration.
+#
+# The `patch` status is the key one: it measures coverage of the *lines changed
+# in the PR* (i.e. new code) and fails + comments when they fall below target.
+# That's the "ping when new code isn't adequately tested" the project wants.
+
+coverage:
+  status:
+    # Coverage of the whole project must not regress below the goal.
+    project:
+      default:
+        target: 80%
+        threshold: 2%          # allow tiny dips without failing
+        informational: false
+    # Coverage of the lines this PR added/changed (new code).
+    patch:
+      default:
+        target: 80%
+        informational: false   # a real check → red ✗ on the PR when unmet
+
+# Always leave a coverage comment on PRs (the visible "ping"), even when the
+# diff doesn't change coverage.
+comment:
+  layout: "condensed_header, diff, flags, files"
+  behavior: default
+  require_changes: false
+
+github_checks:
+  annotations: true
+
+# Pure entry-point wrapper with no logic worth covering.
+ignore:
+  - "src/main.rs"

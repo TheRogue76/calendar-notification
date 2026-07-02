@@ -1,5 +1,8 @@
 # calendar-notification
 
+[![CI](https://github.com/TheRogue76/calendar-notification/actions/workflows/ci.yml/badge.svg)](https://github.com/TheRogue76/calendar-notification/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/TheRogue76/calendar-notification/branch/main/graph/badge.svg)](https://codecov.io/gh/TheRogue76/calendar-notification)
+
 A lightweight **Google Calendar** companion for Ubuntu / GNOME (Wayland):
 
 - **System-tray reminder daemon** — lives in the tray and pops a desktop
@@ -91,6 +94,22 @@ Check status / logs:
 systemctl --user status calendar-notification
 journalctl --user -u calendar-notification -f
 ```
+
+## Continuous integration
+
+Every pull request runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
+
+- **Test & lint** — `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`.
+- **Coverage** — `cargo llvm-cov` uploads to [Codecov](https://about.codecov.io/).
+  Codecov posts a coverage comment on the PR and a **patch** status check that
+  fails when the PR's *new/changed lines* fall below **80%** coverage — so
+  inadequately-tested new code is flagged right on the PR. Thresholds live in
+  [`codecov.yml`](codecov.yml).
+
+**One-time setup:** enable the repo on codecov.io and add its upload token as a
+repository secret named `CODECOV_TOKEN` (Settings → Secrets and variables →
+Actions). To make the checks block merges, add "Test & lint" and `codecov/patch`
+as required status checks in branch protection.
 
 ## Reliability
 
