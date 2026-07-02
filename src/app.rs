@@ -13,9 +13,9 @@ use iced::{window, Element, Size, Subscription, Task, Theme};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::engine::{CalendarView, Command, UiEvent};
-use crate::google::model::Occurrence;
+use crate::google::model::{EventDetails, Occurrence};
 use crate::ui::add_event::{self, FormMsg, FormState};
-use crate::ui::agenda;
+use crate::ui::{agenda, detail};
 
 /// Engine → UI channel, installed by `main` before the daemon starts. The
 /// subscription builder must be a bare `fn` (iced 0.14), so it can't capture the
@@ -36,6 +36,28 @@ pub enum Message {
     SubmitForm,
     Form(FormMsg),
     SetCalendarVisible(String, bool),
+    /// An agenda row was clicked: open the detail pane and fetch full details.
+    SelectEvent {
+        calendar_id: String,
+        event_id: String,
+        title: String,
+    },
+    /// Leave the detail pane, back to the agenda.
+    CloseDetail,
+    /// Edit the currently-loaded event: pre-fill and open the form.
+    EditSelected,
+}
+
+/// State of the detail pane, which takes over the window when an event is
+/// selected (mirrors how the add-event form takes over).
+#[derive(Debug, Clone)]
+pub enum DetailState {
+    /// Details are being fetched; show the title we already have.
+    Loading { title: String },
+    /// Fully-fetched event to display.
+    Loaded(EventDetails),
+    /// The fetch failed.
+    Failed { title: String, message: String },
 }
 
 pub struct App {
@@ -45,6 +67,8 @@ pub struct App {
     pub status: String,
     pub widget: Option<window::Id>,
     pub form: FormState,
+    /// When `Some`, the detail pane is shown (unless the form is also open).
+    pub detail: Option<DetailState>,
 }
 
 impl App {
@@ -56,6 +80,7 @@ impl App {
             status: "Starting…".to_string(),
             widget: None,
             form: FormState::default(),
+            detail: None,
         }
     }
 
@@ -101,6 +126,11 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::OpenAddForm => {
+            // If a previous edit was cancelled, its edit state can linger on the
+            // form; reset so "+ Add event" always opens a clean create form.
+            if app.form.editing.is_some() {
+                app.form.reset();
+            }
             app.form.open = true;
             app.form.error = None;
             Task::none()
@@ -118,7 +148,14 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 Ok(new) => {
                     app.form.submitting = true;
                     app.form.error = None;
-                    app.send(Command::InsertEvent(new));
+                    match &app.form.editing {
+                        Some(target) => app.send(Command::UpdateEvent {
+                            calendar_id: target.calendar_id.clone(),
+                            event_id: target.event_id.clone(),
+                            event: new,
+                        }),
+                        None => app.send(Command::InsertEvent(new)),
+                    }
                 }
                 Err(e) => app.form.error = Some(e),
             }
@@ -126,6 +163,31 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::SetCalendarVisible(id, v) => {
             app.send(Command::SetVisible(id, v));
+            Task::none()
+        }
+        Message::SelectEvent {
+            calendar_id,
+            event_id,
+            title,
+        } => {
+            app.detail = Some(DetailState::Loading {
+                title: title.clone(),
+            });
+            app.send(Command::LoadEvent {
+                calendar_id,
+                event_id,
+            });
+            Task::none()
+        }
+        Message::CloseDetail => {
+            app.detail = None;
+            Task::none()
+        }
+        Message::EditSelected => {
+            if let Some(DetailState::Loaded(details)) = &app.detail {
+                app.form = FormState::prefill(details);
+                app.form.open = true;
+            }
             Task::none()
         }
     }
@@ -162,6 +224,35 @@ fn handle_engine_event(app: &mut App, ev: UiEvent) -> Task<Message> {
             app.form.error = Some(e);
             Task::none()
         }
+        UiEvent::EventLoaded(Ok(details)) => {
+            // Ignore a stale load if the user already left the detail pane.
+            if app.detail.is_some() {
+                app.detail = Some(DetailState::Loaded(details));
+            }
+            Task::none()
+        }
+        UiEvent::EventLoaded(Err(message)) => {
+            if let Some(DetailState::Loading { title }) = &app.detail {
+                app.detail = Some(DetailState::Failed {
+                    title: title.clone(),
+                    message,
+                });
+            }
+            Task::none()
+        }
+        UiEvent::EventUpdated(Ok(_)) => {
+            app.form.submitting = false;
+            app.form.reset();
+            app.form.open = false;
+            app.detail = None;
+            app.status = "Event updated".to_string();
+            Task::none()
+        }
+        UiEvent::EventUpdated(Err(e)) => {
+            app.form.submitting = false;
+            app.form.error = Some(e);
+            Task::none()
+        }
         UiEvent::Status(s) => {
             app.status = s;
             Task::none()
@@ -173,6 +264,8 @@ fn handle_engine_event(app: &mut App, ev: UiEvent) -> Task<Message> {
 pub fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
     if app.form.open {
         add_event::view(&app.form, &app.calendars)
+    } else if let Some(detail) = &app.detail {
+        detail::view(detail, &app.calendars)
     } else {
         agenda::view(app)
     }
@@ -367,6 +460,154 @@ mod tests {
             }
             other => panic!("expected SetVisible, got {other:?}"),
         }
+    }
+
+    fn details() -> EventDetails {
+        let start = chrono::Local::now();
+        EventDetails {
+            calendar_id: "p".into(),
+            event_id: "master".into(),
+            title: "Standup".into(),
+            location: Some("Room".into()),
+            description: Some("notes".into()),
+            all_day: false,
+            start,
+            end: start + chrono::Duration::hours(1),
+            attendees: vec!["a@x.com".into()],
+            recurrence: vec![],
+        }
+    }
+
+    #[test]
+    fn select_event_sets_loading_and_sends_load_command() {
+        let (mut a, mut rx) = app();
+        let _ = update(
+            &mut a,
+            Message::SelectEvent {
+                calendar_id: "p".into(),
+                event_id: "master".into(),
+                title: "Standup".into(),
+            },
+        );
+        assert!(matches!(a.detail, Some(DetailState::Loading { .. })));
+        match rx.try_recv() {
+            Ok(Command::LoadEvent {
+                calendar_id,
+                event_id,
+            }) => {
+                assert_eq!(calendar_id, "p");
+                assert_eq!(event_id, "master");
+            }
+            other => panic!("expected LoadEvent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn event_loaded_transitions_loading_to_loaded_and_ignores_stale() {
+        let (mut a, _rx) = app();
+        a.detail = Some(DetailState::Loading { title: "T".into() });
+        let _ = update(&mut a, Message::Engine(UiEvent::EventLoaded(Ok(details()))));
+        assert!(matches!(a.detail, Some(DetailState::Loaded(_))));
+
+        // A load that arrives after the pane was closed is ignored.
+        a.detail = None;
+        let _ = update(&mut a, Message::Engine(UiEvent::EventLoaded(Ok(details()))));
+        assert!(a.detail.is_none());
+    }
+
+    #[test]
+    fn event_loaded_error_becomes_failed() {
+        let (mut a, _rx) = app();
+        a.detail = Some(DetailState::Loading { title: "T".into() });
+        let _ = update(
+            &mut a,
+            Message::Engine(UiEvent::EventLoaded(Err("boom".into()))),
+        );
+        assert!(matches!(a.detail, Some(DetailState::Failed { .. })));
+    }
+
+    #[test]
+    fn edit_selected_prefills_and_opens_form() {
+        let (mut a, _rx) = app();
+        a.detail = Some(DetailState::Loaded(details()));
+        let _ = update(&mut a, Message::EditSelected);
+        assert!(a.form.open);
+        assert_eq!(a.form.title, "Standup");
+        assert!(a.form.editing.is_some());
+    }
+
+    #[test]
+    fn submit_in_edit_mode_sends_update_event() {
+        let (mut a, mut rx) = app();
+        a.calendars = vec![cal("p", true)];
+        a.form = crate::ui::add_event::FormState::prefill(&details());
+        a.form.open = true;
+        let _ = update(&mut a, Message::SubmitForm);
+        assert!(a.form.submitting);
+        match rx.try_recv() {
+            Ok(Command::UpdateEvent {
+                calendar_id,
+                event_id,
+                ..
+            }) => {
+                assert_eq!(calendar_id, "p");
+                assert_eq!(event_id, "master");
+            }
+            other => panic!("expected UpdateEvent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_add_form_resets_lingering_edit_state() {
+        let (mut a, _rx) = app();
+        // Simulate a cancelled edit: the form still carries edit state.
+        a.form = crate::ui::add_event::FormState::prefill(&details());
+        a.form.open = false;
+        let _ = update(&mut a, Message::OpenAddForm);
+        assert!(a.form.open);
+        assert!(
+            a.form.editing.is_none(),
+            "add form must not be in edit mode"
+        );
+        assert!(a.form.title.is_empty(), "prefilled title must be cleared");
+    }
+
+    #[test]
+    fn close_detail_clears_pane() {
+        let (mut a, _rx) = app();
+        a.detail = Some(DetailState::Loaded(details()));
+        let _ = update(&mut a, Message::CloseDetail);
+        assert!(a.detail.is_none());
+    }
+
+    #[test]
+    fn event_updated_ok_closes_form_and_clears_detail() {
+        let (mut a, _rx) = app();
+        a.form = crate::ui::add_event::FormState::prefill(&details());
+        a.form.open = true;
+        a.form.submitting = true;
+        a.detail = Some(DetailState::Loaded(details()));
+        let _ = update(
+            &mut a,
+            Message::Engine(UiEvent::EventUpdated(Ok("master".into()))),
+        );
+        assert!(!a.form.open);
+        assert!(!a.form.submitting);
+        assert!(a.form.editing.is_none());
+        assert!(a.detail.is_none());
+        assert_eq!(a.status, "Event updated");
+    }
+
+    #[test]
+    fn event_updated_err_surfaces_error() {
+        let (mut a, _rx) = app();
+        a.form.submitting = true;
+        let _ = update(
+            &mut a,
+            Message::Engine(UiEvent::EventUpdated(Err("bad".into()))),
+        );
+        assert!(!a.form.submitting);
+        assert_eq!(a.form.error.as_deref(), Some("bad"));
     }
 
     #[test]

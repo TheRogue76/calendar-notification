@@ -7,8 +7,15 @@ use iced::{Alignment, Element, Length};
 
 use crate::app::Message;
 use crate::engine::CalendarView;
-use crate::google::model::NewEvent;
+use crate::google::model::{EventDetails, NewEvent};
 use crate::ui::recurrence::{Recurrence, RecurrenceKind, Weekdays};
+
+/// Identifies the event an open form is editing (vs. creating a new one).
+#[derive(Debug, Clone)]
+pub struct EditTarget {
+    pub calendar_id: String,
+    pub event_id: String,
+}
 
 /// A calendar option for the pick_list (Display = its name).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +68,9 @@ pub struct FormState {
     pub until_date: String,
     pub error: Option<String>,
     pub submitting: bool,
+    /// `Some` when the form is editing an existing event rather than creating
+    /// one; carries the ids to patch. Cleared by [`reset`](FormState::reset).
+    pub editing: Option<EditTarget>,
 }
 
 impl Default for FormState {
@@ -91,16 +101,41 @@ impl Default for FormState {
             until_date: today.format("%Y-%m-%d").to_string(),
             error: None,
             submitting: false,
+            editing: None,
         }
     }
 }
 
 impl FormState {
-    /// Reset to a fresh form, preserving the selected calendar.
+    /// Reset to a fresh form, preserving the selected calendar. Also clears the
+    /// edit target (via `default`), so the next submit creates rather than edits.
     pub fn reset(&mut self) {
         let keep = self.calendar_id.clone();
         *self = FormState::default();
         self.calendar_id = keep;
+    }
+
+    /// Build a form pre-filled from a fetched event, in edit mode. The recurrence
+    /// controls stay at their defaults and are hidden in the view — the series
+    /// RRULE is preserved server-side rather than re-derived from the presets.
+    pub fn prefill(details: &EventDetails) -> Self {
+        FormState {
+            editing: Some(EditTarget {
+                calendar_id: details.calendar_id.clone(),
+                event_id: details.event_id.clone(),
+            }),
+            title: details.title.clone(),
+            all_day: details.all_day,
+            start_date: details.start.format("%Y-%m-%d").to_string(),
+            start_time: details.start.format("%H:%M").to_string(),
+            end_date: details.end.format("%Y-%m-%d").to_string(),
+            end_time: details.end.format("%H:%M").to_string(),
+            location: details.location.clone().unwrap_or_default(),
+            description: details.description.clone().unwrap_or_default(),
+            guests: details.attendees.join(", "),
+            calendar_id: Some(details.calendar_id.clone()),
+            ..FormState::default()
+        }
     }
 
     /// Apply a field edit.
@@ -207,9 +242,12 @@ pub fn view<'a>(form: &'a FormState, calendars: &'a [CalendarView]) -> Element<'
         column![text(label).size(12), input].spacing(2)
     };
 
+    let editing = form.editing.is_some();
+    let heading = if editing { "Edit event" } else { "New event" };
+
     let mut content = column![
         row![
-            text("New event").size(18),
+            text(heading).size(18),
             iced::widget::space::horizontal(),
             button("Cancel").on_press(Message::CloseAddForm),
         ]
@@ -313,40 +351,44 @@ pub fn view<'a>(form: &'a FormState, calendars: &'a [CalendarView]) -> Element<'
         pick_list(choices, selected, |c| Message::Form(FormMsg::Calendar(c))).into(),
     ));
 
-    // Recurrence picker
-    content = content.push(field(
-        "Repeat",
-        pick_list(Recurrence::ALL.to_vec(), Some(form.recurrence), |r| {
-            Message::Form(FormMsg::Recurrence(r))
-        })
-        .into(),
-    ));
+    // Recurrence controls (creating only). When editing, the existing series
+    // RRULE is preserved server-side, so we hide these rather than round-trip an
+    // arbitrary RRULE through the preset picker.
+    if !editing {
+        content = content.push(field(
+            "Repeat",
+            pick_list(Recurrence::ALL.to_vec(), Some(form.recurrence), |r| {
+                Message::Form(FormMsg::Recurrence(r))
+            })
+            .into(),
+        ));
 
-    // Weekday selector (weekly only)
-    if form.recurrence == RecurrenceKind::Weekly {
-        let mut days = row![].spacing(4);
-        for (i, label) in WEEKDAY_LABELS.iter().enumerate() {
-            days = days.push(
-                checkbox(form.weekdays.days[i])
-                    .label(*label)
-                    .on_toggle(move |v| Message::Form(FormMsg::ToggleWeekday(i, v))),
-            );
+        // Weekday selector (weekly only)
+        if form.recurrence == RecurrenceKind::Weekly {
+            let mut days = row![].spacing(4);
+            for (i, label) in WEEKDAY_LABELS.iter().enumerate() {
+                days = days.push(
+                    checkbox(form.weekdays.days[i])
+                        .label(*label)
+                        .on_toggle(move |v| Message::Form(FormMsg::ToggleWeekday(i, v))),
+                );
+            }
+            content = content.push(days);
         }
-        content = content.push(days);
-    }
 
-    // Optional until-date
-    if form.recurrence != RecurrenceKind::None {
-        content = content.push(
-            checkbox(form.until_enabled)
-                .label("Ends on")
-                .on_toggle(|v| Message::Form(FormMsg::UntilEnabled(v))),
-        );
-        if form.until_enabled {
+        // Optional until-date
+        if form.recurrence != RecurrenceKind::None {
             content = content.push(
-                text_input("YYYY-MM-DD", &form.until_date)
-                    .on_input(|s| Message::Form(FormMsg::UntilDate(s))),
+                checkbox(form.until_enabled)
+                    .label("Ends on")
+                    .on_toggle(|v| Message::Form(FormMsg::UntilEnabled(v))),
             );
+            if form.until_enabled {
+                content = content.push(
+                    text_input("YYYY-MM-DD", &form.until_date)
+                        .on_input(|s| Message::Form(FormMsg::UntilDate(s))),
+                );
+            }
         }
     }
 
@@ -356,6 +398,8 @@ pub fn view<'a>(form: &'a FormState, calendars: &'a [CalendarView]) -> Element<'
 
     let submit_label = if form.submitting {
         "Saving…"
+    } else if editing {
+        "Save changes"
     } else {
         "Save event"
     };
@@ -603,6 +647,46 @@ mod tests {
         f.until_enabled = true;
         f.error = Some("boom".into());
         f.submitting = true;
+        let _ = view(&f, &cals());
+    }
+
+    fn details() -> EventDetails {
+        let start = Local.with_ymd_and_hms(2026, 7, 2, 9, 0, 0).unwrap();
+        EventDetails {
+            calendar_id: "w".into(),
+            event_id: "master".into(),
+            title: "Retro".into(),
+            location: Some("Room 2".into()),
+            description: Some("notes".into()),
+            all_day: false,
+            start,
+            end: start + chrono::Duration::hours(1),
+            attendees: vec!["a@x.com".into(), "b@y.com".into()],
+            recurrence: vec!["RRULE:FREQ=WEEKLY".into()],
+        }
+    }
+
+    #[test]
+    fn prefill_populates_fields_and_sets_edit_target() {
+        let f = FormState::prefill(&details());
+        let target = f.editing.as_ref().expect("editing target set");
+        assert_eq!(target.calendar_id, "w");
+        assert_eq!(target.event_id, "master");
+        assert_eq!(f.title, "Retro");
+        assert_eq!(f.location, "Room 2");
+        assert_eq!(f.description, "notes");
+        assert_eq!(f.guests, "a@x.com, b@y.com");
+        assert_eq!(f.calendar_id.as_deref(), Some("w"));
+        assert_eq!(f.start_date, "2026-07-02");
+        assert_eq!(f.start_time, "09:00");
+        // A prefilled form rebuilds into a valid NewEvent for the update path.
+        assert!(f.build(&cals()).is_ok());
+    }
+
+    #[test]
+    fn view_builds_in_edit_mode() {
+        // Edit mode hides the recurrence controls and relabels the buttons.
+        let f = FormState::prefill(&details());
         let _ = view(&f, &cals());
     }
 }

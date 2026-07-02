@@ -16,7 +16,7 @@ use tokio::time::{Duration as TokioDuration, Instant};
 use tracing::{error, info, warn};
 
 use crate::config::Config;
-use crate::google::model::{Calendar, NewEvent, Occurrence};
+use crate::google::model::{Calendar, EventDetails, NewEvent, Occurrence};
 use crate::notify;
 use crate::tray::CalTray;
 
@@ -43,6 +43,13 @@ pub trait CalendarSource {
         time_max: DateTime<Utc>,
     ) -> Result<Vec<Occurrence>>;
     async fn insert_event(&self, new: &NewEvent) -> Result<String>;
+    async fn get_event(&self, calendar_id: &str, event_id: &str) -> Result<EventDetails>;
+    async fn update_event(
+        &self,
+        calendar_id: &str,
+        event_id: &str,
+        ev: &NewEvent,
+    ) -> Result<String>;
 }
 
 /// Messages flowing from the engine to the UI (bridged into an iced subscription).
@@ -56,6 +63,10 @@ pub enum UiEvent {
     ToggleWidget,
     /// Result of an add-event request: Ok(event_id) or Err(message).
     EventCreated(std::result::Result<String, String>),
+    /// Full details of a selected event: Ok(details) or Err(message).
+    EventLoaded(std::result::Result<EventDetails, String>),
+    /// Result of an edit request: Ok(event_id) or Err(message).
+    EventUpdated(std::result::Result<String, String>),
     /// Human-readable status line (sync in progress, offline, etc.).
     Status(String),
     /// The user chose Quit.
@@ -80,6 +91,17 @@ pub enum Command {
     SyncNow,
     /// Create a new event, then resync.
     InsertEvent(NewEvent),
+    /// Fetch full details of an event for the detail pane / edit form.
+    LoadEvent {
+        calendar_id: String,
+        event_id: String,
+    },
+    /// Patch an existing event (whole series for recurring), then resync.
+    UpdateEvent {
+        calendar_id: String,
+        event_id: String,
+        event: NewEvent,
+    },
     /// Set a calendar's agenda visibility.
     SetVisible(String, bool),
     /// Set whether a calendar fires reminders.
@@ -342,6 +364,33 @@ impl<C: CalendarSource> Engine<C> {
                     self.resync().await;
                 }
             }
+            Command::LoadEvent {
+                calendar_id,
+                event_id,
+            } => {
+                let result = self
+                    .client
+                    .get_event(&calendar_id, &event_id)
+                    .await
+                    .map_err(|e| format!("{e:#}"));
+                self.emit(UiEvent::EventLoaded(result));
+            }
+            Command::UpdateEvent {
+                calendar_id,
+                event_id,
+                event,
+            } => {
+                let result = self
+                    .client
+                    .update_event(&calendar_id, &event_id, &event)
+                    .await
+                    .map_err(|e| format!("{e:#}"));
+                let ok = result.is_ok();
+                self.emit(UiEvent::EventUpdated(result));
+                if ok {
+                    self.resync().await;
+                }
+            }
             Command::Quit => {
                 self.emit(UiEvent::Quit);
                 return false;
@@ -453,6 +502,7 @@ mod tests {
         calendars: Vec<Calendar>,
         events: std::collections::HashMap<String, Vec<Occurrence>>,
         inserted: Mutex<Vec<NewEvent>>,
+        updated: Mutex<Vec<(String, String, NewEvent)>>,
         fail_calendars: bool,
     }
 
@@ -462,6 +512,7 @@ mod tests {
                 calendars,
                 events: std::collections::HashMap::new(),
                 inserted: Mutex::new(Vec::new()),
+                updated: Mutex::new(Vec::new()),
                 fail_calendars: false,
             }
         }
@@ -486,6 +537,33 @@ mod tests {
             self.inserted.lock().unwrap().push(new.clone());
             Ok("new-id".into())
         }
+        async fn get_event(&self, calendar_id: &str, event_id: &str) -> Result<EventDetails> {
+            Ok(EventDetails {
+                calendar_id: calendar_id.into(),
+                event_id: event_id.into(),
+                title: "Fetched".into(),
+                location: None,
+                description: None,
+                all_day: false,
+                start: Local::now(),
+                end: Local::now(),
+                attendees: vec![],
+                recurrence: vec![],
+            })
+        }
+        async fn update_event(
+            &self,
+            calendar_id: &str,
+            event_id: &str,
+            ev: &NewEvent,
+        ) -> Result<String> {
+            self.updated.lock().unwrap().push((
+                calendar_id.to_string(),
+                event_id.to_string(),
+                ev.clone(),
+            ));
+            Ok(event_id.into())
+        }
     }
 
     // -- builders ------------------------------------------------------------
@@ -502,6 +580,7 @@ mod tests {
     fn occ(cal_id: &str, start: DateTime<Local>, reminders: Vec<i64>) -> Occurrence {
         Occurrence {
             event_id: format!("evt-{cal_id}"),
+            recurring_event_id: None,
             calendar_id: cal_id.into(),
             title: "T".into(),
             location: None,
@@ -732,6 +811,56 @@ mod tests {
         assert!(evs
             .iter()
             .any(|ev| matches!(ev, UiEvent::EventCreated(Ok(_)))));
+    }
+
+    #[tokio::test]
+    async fn handle_load_event_emits_details() {
+        let (mut e, mut rx, _d) =
+            engine_with(FakeSource::new(vec![cal("p", true)]), Config::default());
+        e.handle_command(Command::LoadEvent {
+            calendar_id: "p".into(),
+            event_id: "evt".into(),
+        })
+        .await;
+        let evs = drain(&mut rx);
+        assert!(evs.iter().any(|ev| matches!(
+            ev,
+            UiEvent::EventLoaded(Ok(d)) if d.event_id == "evt" && d.calendar_id == "p"
+        )));
+    }
+
+    #[tokio::test]
+    async fn handle_update_event_patches_and_resyncs() {
+        let (mut e, mut rx, _d) =
+            engine_with(FakeSource::new(vec![cal("p", true)]), Config::default());
+        let event = NewEvent {
+            calendar_id: "p".into(),
+            title: "Edited".into(),
+            location: None,
+            description: None,
+            all_day: false,
+            start: Local.with_ymd_and_hms(2026, 7, 2, 9, 0, 0).unwrap(),
+            end: Local.with_ymd_and_hms(2026, 7, 2, 10, 0, 0).unwrap(),
+            attendees: vec![],
+            recurrence: vec![],
+        };
+        e.handle_command(Command::UpdateEvent {
+            calendar_id: "p".into(),
+            event_id: "master".into(),
+            event,
+        })
+        .await;
+        let recorded = e.client.updated.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, "p");
+        assert_eq!(recorded[0].1, "master");
+        drop(recorded);
+        let evs = drain(&mut rx);
+        assert!(evs
+            .iter()
+            .any(|ev| matches!(ev, UiEvent::EventUpdated(Ok(_)))));
+        // Ok -> a resync follows, republishing occurrences.
+        assert!(evs.iter().any(|ev| matches!(ev, UiEvent::Occurrences(_))));
     }
 
     // -- run_loop end-to-end -------------------------------------------------

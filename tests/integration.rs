@@ -5,7 +5,9 @@
 
 use calendar_notification::config::Config;
 use calendar_notification::engine::CalendarSource;
-use calendar_notification::google::model::{Calendar, NewEvent, Occurrence, ReminderRule};
+use calendar_notification::google::model::{
+    Calendar, EventDetails, NewEvent, Occurrence, ReminderRule,
+};
 use calendar_notification::ui::recurrence::{Recurrence, Weekdays};
 
 use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
@@ -47,6 +49,7 @@ fn occurrence_reminder_math_is_public() {
     let start = Local.with_ymd_and_hms(2026, 7, 2, 9, 0, 0).unwrap();
     let occ = Occurrence {
         event_id: "e".into(),
+        recurring_event_id: None,
         calendar_id: "c".into(),
         title: "t".into(),
         location: None,
@@ -85,6 +88,28 @@ impl CalendarSource for FakeSource {
     async fn insert_event(&self, _new: &NewEvent) -> anyhow::Result<String> {
         Ok("created-id".into())
     }
+    async fn get_event(&self, calendar_id: &str, event_id: &str) -> anyhow::Result<EventDetails> {
+        Ok(EventDetails {
+            calendar_id: calendar_id.into(),
+            event_id: event_id.into(),
+            title: "Fetched".into(),
+            location: None,
+            description: None,
+            all_day: false,
+            start: Local.with_ymd_and_hms(2026, 7, 2, 9, 0, 0).unwrap(),
+            end: Local.with_ymd_and_hms(2026, 7, 2, 10, 0, 0).unwrap(),
+            attendees: vec![],
+            recurrence: vec![],
+        })
+    }
+    async fn update_event(
+        &self,
+        _calendar_id: &str,
+        event_id: &str,
+        _ev: &NewEvent,
+    ) -> anyhow::Result<String> {
+        Ok(event_id.into())
+    }
 }
 
 #[tokio::test]
@@ -111,4 +136,11 @@ async fn calendar_source_trait_is_publicly_implementable() {
         recurrence: vec![],
     };
     assert_eq!(src.insert_event(&new).await.unwrap(), "created-id");
+
+    let details = src.get_event("primary", "evt").await.unwrap();
+    assert_eq!(details.event_id, "evt");
+    assert_eq!(
+        src.update_event("primary", "evt", &new).await.unwrap(),
+        "evt"
+    );
 }
