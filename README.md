@@ -91,6 +91,15 @@ systemctl --user status calendar-notification
 journalctl --user -u calendar-notification -f
 ```
 
+## Reliability
+
+The app is **fail-fast**: any unexpected panic (on any thread) logs and then
+exits the whole process, rather than leaving a half-dead state (e.g. a live tray
+with a silently-stopped sync/reminder engine). When run under the systemd user
+service above, `Restart=on-failure` restarts it automatically, so fail-fast
+becomes self-healing. If you run it in a terminal instead, it will exit on a
+panic and you'll see the backtrace (set `RUST_BACKTRACE=1` for detail).
+
 ## Configuration
 
 `~/.config/calendar-notification/config.toml`:

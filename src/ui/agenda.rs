@@ -115,7 +115,13 @@ fn event_row<'a>(app: &'a App, occ: &'a Occurrence) -> Element<'a, Message> {
 /// Parse `#RRGGBB` into an iced Color; falls back to gray.
 fn parse_hex(hex: &str) -> Color {
     let h = hex.trim_start_matches('#');
-    if h.len() == 6 {
+    // Validate ASCII-hex on the raw bytes *before* the byte-index slices below.
+    // `h.len()` counts bytes, so a 6-byte non-ASCII string (e.g. a multi-byte
+    // UTF-8 char) would otherwise let the slices split a char boundary and
+    // panic. `is_ascii_hexdigit` guarantees every byte is one ASCII char, so
+    // the 0..2 / 2..4 / 4..6 slices land on boundaries.
+    let bytes = h.as_bytes();
+    if bytes.len() == 6 && bytes.iter().all(u8::is_ascii_hexdigit) {
         if let (Ok(r), Ok(g), Ok(b)) = (
             u8::from_str_radix(&h[0..2], 16),
             u8::from_str_radix(&h[2..4], 16),
@@ -125,4 +131,27 @@ fn parse_hex(hex: &str) -> Color {
         }
     }
     Color::from_rgb(0.5, 0.5, 0.5)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_hex;
+
+    #[test]
+    fn non_ascii_six_byte_color_does_not_panic() {
+        // "€abc" is 6 bytes, but byte offsets 2 and 4 fall inside the 3-byte
+        // '€'. The old slice-based parse panicked on this; now it falls back
+        // to gray without panicking.
+        let c = parse_hex("€abc");
+        assert!((c.r - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn valid_hex_parses() {
+        let c = parse_hex("#4285F4");
+        assert_eq!(
+            (c.r, c.g, c.b),
+            (0x42 as f32 / 255.0, 0x85 as f32 / 255.0, 0xF4 as f32 / 255.0)
+        );
+    }
 }

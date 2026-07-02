@@ -28,6 +28,17 @@ use google::{auth::build_authenticator, client::GoogleClient};
 use tray::CalTray;
 
 fn main() -> iced::Result {
+    // Fail-fast: any panic on any thread logs (via the default hook, keeping the
+    // location/message/backtrace) and then takes the whole process down. Without
+    // this, a panic on the background engine thread would silently kill sync and
+    // reminders while the tray/UI kept running — a zombie that looks healthy.
+    // Under the systemd unit (Restart=on-failure) this becomes self-healing.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        std::process::exit(101);
+    }));
+
     // Select the rustls crypto provider explicitly. Multiple providers may be
     // compiled in transitively (ring + aws-lc-rs), in which case rustls refuses
     // to auto-pick and panics on first TLS use — installing one here is the

@@ -402,5 +402,7 @@ fn local_datetime(date: NaiveDate, time: NaiveTime) -> Result<chrono::DateTime<L
 }
 
 fn local_midnight(date: NaiveDate) -> Result<chrono::DateTime<Local>, String> {
-    local_datetime(date, NaiveTime::from_hms_opt(0, 0, 0).unwrap())
+    // 00:00:00 is always a valid time, so this unwrap can never fire.
+    let midnight = NaiveTime::from_hms_opt(0, 0, 0).expect("00:00:00 is a valid time");
+    local_datetime(date, midnight)
 }

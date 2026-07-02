@@ -293,7 +293,8 @@ pub async fn run(
     mut cmd_rx: UnboundedReceiver<Command>,
     tray: Option<ksni::Handle<CalTray>>,
 ) {
-    let poll_every = TokioDuration::from_secs(config.poll_interval_minutes.max(1) * 60);
+    let poll_every =
+        TokioDuration::from_secs(config.poll_interval_minutes.max(1).saturating_mul(60));
     let mut engine = Engine {
         config,
         client,
@@ -312,9 +313,16 @@ pub async fn run(
     loop {
         // Recompute the next reminder each iteration; state may have changed.
         let next = engine.next_reminder();
-        let sleep = next
-            .as_ref()
-            .map(|(fire, ..)| tokio::time::sleep_until(deadline_for(*fire)));
+        // A single future for the reminder arm: it sleeps until the next fire
+        // time, or — when nothing is scheduled — never resolves, so the arm
+        // simply stays dormant. This avoids any unwrap/precondition coupling.
+        let fire_at = next.as_ref().map(|(fire, ..)| deadline_for(*fire));
+        let reminder_ready = async move {
+            match fire_at {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
 
         tokio::select! {
             cmd = cmd_rx.recv() => {
@@ -330,9 +338,10 @@ pub async fn run(
             _ = poll.tick() => {
                 engine.resync().await;
             }
-            _ = async { sleep.unwrap().await }, if next.is_some() => {
-                let (_, idx, minutes, key) = next.unwrap();
-                engine.fire_reminder(idx, minutes, key).await;
+            _ = reminder_ready => {
+                if let Some((_, idx, minutes, key)) = next {
+                    engine.fire_reminder(idx, minutes, key).await;
+                }
             }
         }
     }
