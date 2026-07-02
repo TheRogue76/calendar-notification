@@ -57,6 +57,7 @@ iced daemon (main thread) ◀── Subscription bridge (static UI_RX) ──
 | `config.rs` | TOML config at `~/.config/calendar-notification/config.toml`; XDG paths |
 | `engine.rs` | `UiEvent`/`Command`/`CalendarView` types; sync + scheduler + command hub loop |
 | `notify.rs` | `notify-rust` reminder wrapper (async) |
+| `icon.rs` | Draws the colored-calendar glyph as RGBA; shared by the tray (repacked to ARGB) and the widget window icon |
 | `tray.rs` | `ksni` tray: menu, per-calendar submenu, sends `Command`s |
 | `app.rs` | iced daemon: `App` state, `Message`, update/view/subscription, window toggle |
 | `ui/agenda.rs` | Today's agenda list + calendar filter chips |
@@ -98,6 +99,17 @@ iced daemon (main thread) ◀── Subscription bridge (static UI_RX) ──
   through a `static OnceLock<Mutex<Option<Receiver>>>` (`app.rs::UI_RX`) and
   drained inside `iced::stream::channel`. If you add another external event
   source, follow the same pattern.
+
+- **Two different icons; the dock one needs a `.desktop` file.** The *tray
+  indicator* icon is set in-process (`tray.rs::icon_pixmap`, ARGB32). The *widget
+  window* icon (GNOME dock / launcher / titlebar) is separate: `app.rs` sets
+  `window::Settings.icon` (honoured on X11) **and** `application_id =
+  "calendar-notification"`. On GNOME/**Wayland** the client window pixmap is
+  ignored — the dock icon is resolved by matching that `application_id` to an
+  installed `assets/calendar-notification.desktop` (basename / `StartupWMClass`)
+  and using its `Icon=`. So changing the window icon means editing `icon.rs` (the
+  glyph) *and* keeping the desktop file + `application_id` in sync; without the
+  installed desktop entry GNOME shows a generic gear. README documents the install.
 
 - **Window ✕ hides, doesn't quit.** The widget window uses
   `exit_on_close_request: true`; in daemon mode that only closes the *window*

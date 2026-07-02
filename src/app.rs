@@ -98,6 +98,17 @@ impl App {
                 decorations: true,
                 level: window::Level::AlwaysOnTop,
                 position: window::Position::Centered,
+                // The colored calendar glyph as the window/titlebar/taskbar icon.
+                // Honoured on X11; on GNOME/Wayland the dock icon comes from the
+                // `.desktop` file matched via `application_id` below instead.
+                icon: window_icon(),
+                platform_specific: window::settings::PlatformSpecific {
+                    // Must match the installed `calendar-notification.desktop`
+                    // basename / its `StartupWMClass` so GNOME shows our icon in
+                    // the dock rather than a generic fallback.
+                    application_id: "calendar-notification".to_string(),
+                    ..window::settings::PlatformSpecific::default()
+                },
                 // Let the titlebar ✕ close (hide) the widget window. In daemon
                 // mode this only closes the window — the process, tray, and
                 // reminders keep running — and `close_events()` clears
@@ -110,6 +121,12 @@ impl App {
             open.discard()
         }
     }
+}
+
+/// The widget window icon: the shared colored calendar glyph at 64×64.
+fn window_icon() -> Option<window::Icon> {
+    const SIZE: u32 = 64;
+    window::icon::from_rgba(crate::icon::calendar_rgba(SIZE), SIZE, SIZE).ok()
 }
 
 pub fn update(app: &mut App, message: Message) -> Task<Message> {
@@ -570,6 +587,11 @@ mod tests {
             "add form must not be in edit mode"
         );
         assert!(a.form.title.is_empty(), "prefilled title must be cleared");
+    }
+
+    #[test]
+    fn window_icon_builds_from_rgba() {
+        assert!(window_icon().is_some(), "64x64 RGBA must be a valid icon");
     }
 
     #[test]

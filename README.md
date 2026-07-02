@@ -95,6 +95,27 @@ systemctl --user status calendar-notification
 journalctl --user -u calendar-notification -f
 ```
 
+## App icon (dock / launcher)
+
+The tray indicator draws its own colored calendar icon, but the **widget
+window's** icon in the GNOME dock/launcher comes from a `.desktop` file: on
+Wayland the compositor matches the window (via its `application_id`) to an
+installed desktop entry and uses that entry's `Icon=`. Without it you get a
+generic fallback. Install the icon + desktop entry so the dock shows the
+calendar:
+
+```bash
+install -Dm644 assets/calendar-notification.svg \
+    ~/.local/share/icons/hicolor/scalable/apps/calendar-notification.svg
+install -Dm644 assets/calendar-notification.desktop \
+    ~/.local/share/applications/calendar-notification.desktop
+update-icon-caches ~/.local/share/icons/hicolor 2>/dev/null || true
+```
+
+Log out/in (or restart GNOME Shell) if the dock doesn't pick it up immediately.
+The desktop entry's `StartupWMClass` matches the window `application_id`
+(`calendar-notification`), which is how the match is made.
+
 ## Continuous integration
 
 Every pull request runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):

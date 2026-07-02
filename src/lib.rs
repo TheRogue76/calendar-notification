@@ -16,6 +16,7 @@ pub mod app;
 pub mod config;
 pub mod engine;
 pub mod google;
+pub mod icon;
 pub mod notify;
 pub mod tray;
 pub mod ui;
