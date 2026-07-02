@@ -2,6 +2,7 @@
 //! as [`Command`]s to the engine; the calendar submenu reflects live state,
 //! which the engine refreshes through the returned [`ksni::Handle`].
 
+use chrono::{DateTime, Local};
 use ksni::menu::{CheckmarkItem, StandardItem, SubMenu};
 use ksni::{Icon, MenuItem, Tray, TrayMethods};
 use tokio::sync::mpsc::UnboundedSender;
@@ -9,9 +10,18 @@ use tracing::warn;
 
 use crate::engine::{CalendarView, Command};
 
+/// The soonest upcoming event, shown as a label at the top of the tray menu.
+/// The engine picks it; the tray formats the relative time at render.
+#[derive(Debug, Clone)]
+pub struct NextEvent {
+    pub title: String,
+    pub start: DateTime<Local>,
+}
+
 pub struct CalTray {
     pub tx: UnboundedSender<Command>,
     pub calendars: Vec<CalendarView>,
+    pub next_event: Option<NextEvent>,
 }
 
 impl CalTray {
@@ -19,6 +29,7 @@ impl CalTray {
         Self {
             tx,
             calendars: Vec::new(),
+            next_event: None,
         }
     }
 
@@ -69,7 +80,28 @@ impl Tray for CalTray {
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
-        let mut items: Vec<MenuItem<Self>> = vec![
+        let mut items: Vec<MenuItem<Self>> = Vec::new();
+
+        // "Up next" label at the top: a disabled item so it reads as text, not a
+        // clickable action. Formatted here so the relative time is fresh each
+        // time the menu opens.
+        if let Some(ev) = &self.next_event {
+            items.push(
+                StandardItem {
+                    label: format!(
+                        "Next: {} — {}",
+                        ev.title,
+                        format_relative(ev.start, Local::now())
+                    ),
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+            );
+            items.push(MenuItem::Separator);
+        }
+
+        items.extend([
             StandardItem {
                 label: "Show / hide widget".into(),
                 activate: Box::new(|t: &mut Self| t.send(Command::ToggleWidget)),
@@ -84,7 +116,7 @@ impl Tray for CalTray {
             }
             .into(),
             MenuItem::Separator,
-        ];
+        ]);
 
         // Per-calendar submenu with Visible / Notify checkboxes.
         if !self.calendars.is_empty() {
@@ -155,6 +187,34 @@ impl Tray for CalTray {
     }
 }
 
+/// Human-friendly lead time until `start`, phrased for the tray label:
+/// `"now"` once it has started, else `"in 5 min"` / `"in 2 h 10 min"` /
+/// `"in 3 days"`.
+fn format_relative(start: DateTime<Local>, now: DateTime<Local>) -> String {
+    let delta = start - now;
+    let mins = delta.num_minutes();
+    if mins <= 0 {
+        return "now".into();
+    }
+    if mins < 60 {
+        return format!("in {mins} min");
+    }
+    let hours = delta.num_hours();
+    if hours < 24 {
+        let rem = mins - hours * 60;
+        if rem == 0 {
+            return format!("in {hours} h");
+        }
+        return format!("in {hours} h {rem} min");
+    }
+    let days = delta.num_days();
+    if days == 1 {
+        "in 1 day".into()
+    } else {
+        format!("in {days} days")
+    }
+}
+
 /// The colored calendar glyph (see [`crate::icon`]) repacked into a ksni
 /// [`Icon`]: ARGB32 in network byte order (A, R, G, B), vs. the shared drawing's
 /// RGBA. Same glyph as the widget's window icon, so tray and dock stay in sync.
@@ -173,6 +233,7 @@ fn calendar_icon(size: u32) -> Icon {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
     fn view(id: &str) -> CalendarView {
@@ -240,6 +301,59 @@ mod tests {
         let pixmaps = t.icon_pixmap();
         assert_eq!(pixmaps.len(), 4);
         assert!(pixmaps.iter().all(|i| !i.data.is_empty()));
+    }
+
+    fn first_label(items: &[MenuItem<CalTray>]) -> Option<String> {
+        items.iter().find_map(|i| match i {
+            MenuItem::Standard(s) => Some(s.label.clone()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn format_relative_covers_ranges() {
+        let now = Local.with_ymd_and_hms(2026, 7, 2, 12, 0, 0).unwrap();
+        assert_eq!(
+            format_relative(now - chrono::Duration::minutes(1), now),
+            "now"
+        );
+        assert_eq!(format_relative(now, now), "now");
+        assert_eq!(
+            format_relative(now + chrono::Duration::minutes(5), now),
+            "in 5 min"
+        );
+        assert_eq!(
+            format_relative(now + chrono::Duration::hours(2), now),
+            "in 2 h"
+        );
+        assert_eq!(
+            format_relative(now + chrono::Duration::minutes(130), now),
+            "in 2 h 10 min"
+        );
+        assert_eq!(
+            format_relative(now + chrono::Duration::hours(24), now),
+            "in 1 day"
+        );
+        assert_eq!(
+            format_relative(now + chrono::Duration::days(3), now),
+            "in 3 days"
+        );
+    }
+
+    #[test]
+    fn menu_shows_next_event_when_set() {
+        let (tx, _rx) = unbounded_channel();
+        let mut t = CalTray::new(tx);
+        assert!(t.next_event.is_none());
+        // Without a next event, the first item is a regular action, not "Next:".
+        assert!(!first_label(&t.menu()).unwrap().starts_with("Next:"));
+
+        t.next_event = Some(NextEvent {
+            title: "Standup".into(),
+            start: Local::now() + chrono::Duration::minutes(30),
+        });
+        let label = first_label(&t.menu()).unwrap();
+        assert!(label.starts_with("Next: Standup — in"), "got {label:?}");
     }
 
     #[test]

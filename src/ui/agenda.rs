@@ -122,6 +122,7 @@ fn event_row<'a>(app: &'a App, occ: &'a Occurrence) -> Element<'a, Message> {
         .on_press(Message::SelectEvent {
             calendar_id: occ.calendar_id.clone(),
             event_id: occ.edit_target_id().to_string(),
+            instance_id: occ.event_id.clone(),
             title: occ.title.clone(),
         })
         .style(button::text)

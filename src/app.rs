@@ -37,15 +37,29 @@ pub enum Message {
     Form(FormMsg),
     SetCalendarVisible(String, bool),
     /// An agenda row was clicked: open the detail pane and fetch full details.
+    /// `event_id` is the edit/delete-series target (series master for a
+    /// recurring event); `instance_id` is the per-instance id, needed to delete
+    /// just this occurrence.
     SelectEvent {
         calendar_id: String,
         event_id: String,
+        instance_id: String,
         title: String,
     },
     /// Leave the detail pane, back to the agenda.
     CloseDetail,
     /// Edit the currently-loaded event: pre-fill and open the form.
     EditSelected,
+    /// Delete pressed: expand the inline confirm / recurring-scope buttons.
+    RequestDelete,
+    /// Back out of the delete confirmation.
+    CancelDelete,
+    /// Commit a delete of the given event id (the view resolves instance vs
+    /// series).
+    ConfirmDelete {
+        calendar_id: String,
+        event_id: String,
+    },
 }
 
 /// State of the detail pane, which takes over the window when an event is
@@ -69,6 +83,11 @@ pub struct App {
     pub form: FormState,
     /// When `Some`, the detail pane is shown (unless the form is also open).
     pub detail: Option<DetailState>,
+    /// Per-instance id of the selected occurrence, kept so a recurring event can
+    /// be deleted as just-this-instance (the detail pane loads the series master).
+    pub selected_instance: Option<String>,
+    /// Whether the detail pane's inline delete confirmation is showing.
+    pub delete_prompt: bool,
 }
 
 impl App {
@@ -81,6 +100,8 @@ impl App {
             widget: None,
             form: FormState::default(),
             detail: None,
+            selected_instance: None,
+            delete_prompt: false,
         }
     }
 
@@ -185,11 +206,14 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::SelectEvent {
             calendar_id,
             event_id,
+            instance_id,
             title,
         } => {
             app.detail = Some(DetailState::Loading {
                 title: title.clone(),
             });
+            app.selected_instance = Some(instance_id);
+            app.delete_prompt = false;
             app.send(Command::LoadEvent {
                 calendar_id,
                 event_id,
@@ -198,6 +222,8 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::CloseDetail => {
             app.detail = None;
+            app.selected_instance = None;
+            app.delete_prompt = false;
             Task::none()
         }
         Message::EditSelected => {
@@ -205,6 +231,25 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.form = FormState::prefill(details);
                 app.form.open = true;
             }
+            Task::none()
+        }
+        Message::RequestDelete => {
+            app.delete_prompt = true;
+            Task::none()
+        }
+        Message::CancelDelete => {
+            app.delete_prompt = false;
+            Task::none()
+        }
+        Message::ConfirmDelete {
+            calendar_id,
+            event_id,
+        } => {
+            app.delete_prompt = false;
+            app.send(Command::DeleteEvent {
+                calendar_id,
+                event_id,
+            });
             Task::none()
         }
     }
@@ -270,6 +315,19 @@ fn handle_engine_event(app: &mut App, ev: UiEvent) -> Task<Message> {
             app.form.error = Some(e);
             Task::none()
         }
+        UiEvent::EventDeleted(Ok(())) => {
+            app.detail = None;
+            app.selected_instance = None;
+            app.delete_prompt = false;
+            app.status = "Event deleted".to_string();
+            Task::none()
+        }
+        UiEvent::EventDeleted(Err(e)) => {
+            // Keep the detail pane open so the user can retry; surface the error.
+            app.delete_prompt = false;
+            app.status = e;
+            Task::none()
+        }
         UiEvent::Status(s) => {
             app.status = s;
             Task::none()
@@ -282,7 +340,12 @@ pub fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
     if app.form.open {
         add_event::view(&app.form, &app.calendars)
     } else if let Some(detail) = &app.detail {
-        detail::view(detail, &app.calendars)
+        detail::view(
+            detail,
+            &app.calendars,
+            app.delete_prompt,
+            app.selected_instance.as_deref(),
+        )
     } else {
         agenda::view(app)
     }
@@ -503,10 +566,12 @@ mod tests {
             Message::SelectEvent {
                 calendar_id: "p".into(),
                 event_id: "master".into(),
+                instance_id: "master_20260702".into(),
                 title: "Standup".into(),
             },
         );
         assert!(matches!(a.detail, Some(DetailState::Loading { .. })));
+        assert_eq!(a.selected_instance.as_deref(), Some("master_20260702"));
         match rx.try_recv() {
             Ok(Command::LoadEvent {
                 calendar_id,
@@ -517,6 +582,80 @@ mod tests {
             }
             other => panic!("expected LoadEvent, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn request_and_cancel_delete_toggle_prompt() {
+        let (mut a, _rx) = app();
+        a.detail = Some(DetailState::Loaded(details()));
+        let _ = update(&mut a, Message::RequestDelete);
+        assert!(a.delete_prompt);
+        let _ = update(&mut a, Message::CancelDelete);
+        assert!(!a.delete_prompt);
+    }
+
+    #[test]
+    fn confirm_delete_sends_command_and_clears_prompt() {
+        let (mut a, mut rx) = app();
+        a.detail = Some(DetailState::Loaded(details()));
+        a.delete_prompt = true;
+        let _ = update(
+            &mut a,
+            Message::ConfirmDelete {
+                calendar_id: "p".into(),
+                event_id: "master".into(),
+            },
+        );
+        assert!(!a.delete_prompt);
+        match rx.try_recv() {
+            Ok(Command::DeleteEvent {
+                calendar_id,
+                event_id,
+            }) => {
+                assert_eq!(calendar_id, "p");
+                assert_eq!(event_id, "master");
+            }
+            other => panic!("expected DeleteEvent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn event_deleted_ok_closes_pane_and_clears_state() {
+        let (mut a, _rx) = app();
+        a.detail = Some(DetailState::Loaded(details()));
+        a.selected_instance = Some("inst".into());
+        a.delete_prompt = true;
+        let _ = update(&mut a, Message::Engine(UiEvent::EventDeleted(Ok(()))));
+        assert!(a.detail.is_none());
+        assert!(a.selected_instance.is_none());
+        assert!(!a.delete_prompt);
+        assert_eq!(a.status, "Event deleted");
+    }
+
+    #[test]
+    fn event_deleted_err_keeps_pane_and_surfaces_status() {
+        let (mut a, _rx) = app();
+        a.detail = Some(DetailState::Loaded(details()));
+        a.delete_prompt = true;
+        let _ = update(
+            &mut a,
+            Message::Engine(UiEvent::EventDeleted(Err("nope".into()))),
+        );
+        assert!(a.detail.is_some());
+        assert!(!a.delete_prompt);
+        assert_eq!(a.status, "nope");
+    }
+
+    #[test]
+    fn close_detail_clears_delete_state() {
+        let (mut a, _rx) = app();
+        a.detail = Some(DetailState::Loaded(details()));
+        a.selected_instance = Some("inst".into());
+        a.delete_prompt = true;
+        let _ = update(&mut a, Message::CloseDetail);
+        assert!(a.detail.is_none());
+        assert!(a.selected_instance.is_none());
+        assert!(!a.delete_prompt);
     }
 
     #[test]
@@ -641,6 +780,12 @@ mod tests {
         let _ = view(&a, id);
         // Form mode.
         a.form.open = true;
+        let _ = view(&a, id);
+        // Detail mode, including the expanded delete prompt.
+        a.form.open = false;
+        a.detail = Some(DetailState::Loaded(details()));
+        a.selected_instance = Some("inst".into());
+        a.delete_prompt = true;
         let _ = view(&a, id);
         assert_eq!(title(&a, id), "Calendar");
         let _ = theme(&a, id);

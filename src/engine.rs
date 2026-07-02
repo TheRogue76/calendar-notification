@@ -18,7 +18,7 @@ use tracing::{error, info, warn};
 use crate::config::Config;
 use crate::google::model::{Calendar, EventDetails, NewEvent, Occurrence};
 use crate::notify;
-use crate::tray::CalTray;
+use crate::tray::{CalTray, NextEvent};
 
 /// Reminders window: how far ahead we fetch occurrences for scheduling.
 ///
@@ -50,6 +50,7 @@ pub trait CalendarSource {
         event_id: &str,
         ev: &NewEvent,
     ) -> Result<String>;
+    async fn delete_event(&self, calendar_id: &str, event_id: &str) -> Result<()>;
 }
 
 /// Messages flowing from the engine to the UI (bridged into an iced subscription).
@@ -67,6 +68,8 @@ pub enum UiEvent {
     EventLoaded(std::result::Result<EventDetails, String>),
     /// Result of an edit request: Ok(event_id) or Err(message).
     EventUpdated(std::result::Result<String, String>),
+    /// Result of a delete request: Ok(()) or Err(message).
+    EventDeleted(std::result::Result<(), String>),
     /// Human-readable status line (sync in progress, offline, etc.).
     Status(String),
     /// The user chose Quit.
@@ -101,6 +104,12 @@ pub enum Command {
         calendar_id: String,
         event_id: String,
         event: NewEvent,
+    },
+    /// Delete an event — a single instance or the whole series, depending on
+    /// which `event_id` the caller resolved — then resync.
+    DeleteEvent {
+        calendar_id: String,
+        event_id: String,
     },
     /// Set a calendar's agenda visibility.
     SetVisible(String, bool),
@@ -251,6 +260,7 @@ impl<C: CalendarSource> Engine<C> {
         self.occurrences = all;
         self.prune_fired();
         self.emit(UiEvent::Occurrences(self.occurrences.clone()));
+        self.publish_next_event().await;
         self.emit(UiEvent::Status(format!(
             "Synced {}",
             Local::now().format("%H:%M")
@@ -272,6 +282,47 @@ impl<C: CalendarSource> Engine<C> {
             k.rsplit_once("::")
                 .is_some_and(|(occ_key, _minutes)| live.contains(occ_key))
         });
+    }
+
+    /// Which calendars are currently visible in the agenda.
+    fn visible_calendars(&self) -> HashMap<String, bool> {
+        self.calendars
+            .iter()
+            .map(|c| {
+                let on = self
+                    .config
+                    .calendars
+                    .get(&c.id)
+                    .map(|p| p.visible)
+                    .unwrap_or(true);
+                (c.id.clone(), on)
+            })
+            .collect()
+    }
+
+    /// The soonest occurrence that hasn't ended yet, on a visible calendar —
+    /// what the tray surfaces as "up next". `occurrences` is sorted by start, so
+    /// the first still-live match is the nearest.
+    fn next_upcoming(&self) -> Option<&Occurrence> {
+        let now = Utc::now();
+        let visible = self.visible_calendars();
+        self.occurrences.iter().find(|o| {
+            o.end.with_timezone(&Utc) > now && visible.get(&o.calendar_id).copied().unwrap_or(true)
+        })
+    }
+
+    /// Push the "up next" event to the tray. The tray formats the relative time
+    /// at render, so we only send the title + start.
+    async fn publish_next_event(&self) {
+        if let Some(handle) = &self.tray {
+            let next = self.next_upcoming().map(|o| NextEvent {
+                title: o.title.clone(),
+                start: o.start,
+            });
+            handle
+                .update(move |t: &mut CalTray| t.next_event = next)
+                .await;
+        }
     }
 
     /// Which calendars currently have notifications enabled.
@@ -391,6 +442,21 @@ impl<C: CalendarSource> Engine<C> {
                     self.resync().await;
                 }
             }
+            Command::DeleteEvent {
+                calendar_id,
+                event_id,
+            } => {
+                let result = self
+                    .client
+                    .delete_event(&calendar_id, &event_id)
+                    .await
+                    .map_err(|e| format!("{e:#}"));
+                let ok = result.is_ok();
+                self.emit(UiEvent::EventDeleted(result));
+                if ok {
+                    self.resync().await;
+                }
+            }
             Command::Quit => {
                 self.emit(UiEvent::Quit);
                 return false;
@@ -448,6 +514,11 @@ async fn run_loop<C: CalendarSource>(
     let mut poll = tokio::time::interval(poll_every);
     poll.tick().await; // consume the immediate first tick (we just synced)
 
+    // Refresh the tray's "up next" label between syncs so relative times stay
+    // fresh and events that have passed roll off without waiting for a poll.
+    let mut tick = tokio::time::interval(TokioDuration::from_secs(60));
+    tick.tick().await; // consume the immediate first tick
+
     loop {
         // Recompute the next reminder each iteration; state may have changed.
         let next = engine.next_reminder();
@@ -476,6 +547,9 @@ async fn run_loop<C: CalendarSource>(
             _ = poll.tick() => {
                 engine.resync().await;
             }
+            _ = tick.tick() => {
+                engine.publish_next_event().await;
+            }
             _ = reminder_ready => {
                 if let Some(r) = next {
                     engine.fire_reminder(r.idx, r.minutes, r.key).await;
@@ -503,6 +577,7 @@ mod tests {
         events: std::collections::HashMap<String, Vec<Occurrence>>,
         inserted: Mutex<Vec<NewEvent>>,
         updated: Mutex<Vec<(String, String, NewEvent)>>,
+        deleted: Mutex<Vec<(String, String)>>,
         fail_calendars: bool,
     }
 
@@ -513,6 +588,7 @@ mod tests {
                 events: std::collections::HashMap::new(),
                 inserted: Mutex::new(Vec::new()),
                 updated: Mutex::new(Vec::new()),
+                deleted: Mutex::new(Vec::new()),
                 fail_calendars: false,
             }
         }
@@ -563,6 +639,13 @@ mod tests {
                 ev.clone(),
             ));
             Ok(event_id.into())
+        }
+        async fn delete_event(&self, calendar_id: &str, event_id: &str) -> Result<()> {
+            self.deleted
+                .lock()
+                .unwrap()
+                .push((calendar_id.to_string(), event_id.to_string()));
+            Ok(())
         }
     }
 
@@ -861,6 +944,58 @@ mod tests {
             .any(|ev| matches!(ev, UiEvent::EventUpdated(Ok(_)))));
         // Ok -> a resync follows, republishing occurrences.
         assert!(evs.iter().any(|ev| matches!(ev, UiEvent::Occurrences(_))));
+    }
+
+    #[tokio::test]
+    async fn handle_delete_event_deletes_and_resyncs() {
+        let (mut e, mut rx, _d) =
+            engine_with(FakeSource::new(vec![cal("p", true)]), Config::default());
+        e.handle_command(Command::DeleteEvent {
+            calendar_id: "p".into(),
+            event_id: "instance-1".into(),
+        })
+        .await;
+        let recorded = e.client.deleted.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0], ("p".to_string(), "instance-1".to_string()));
+        drop(recorded);
+        let evs = drain(&mut rx);
+        assert!(evs
+            .iter()
+            .any(|ev| matches!(ev, UiEvent::EventDeleted(Ok(())))));
+        // Ok -> a resync follows, republishing occurrences.
+        assert!(evs.iter().any(|ev| matches!(ev, UiEvent::Occurrences(_))));
+    }
+
+    // -- next_upcoming -------------------------------------------------------
+
+    #[tokio::test]
+    async fn next_upcoming_picks_first_live_visible_event() {
+        let mut fake = FakeSource::new(vec![cal("p", true)]);
+        let past = occ("p", Local::now() - Duration::hours(2), vec![]);
+        let soon = occ("p", Local::now() + Duration::minutes(30), vec![]);
+        let later = occ("p", Local::now() + Duration::hours(3), vec![]);
+        // Insert out of order; resync sorts by start.
+        fake.events
+            .insert("p".into(), vec![later, past, soon.clone()]);
+        let (mut e, _rx, _d) = engine_with(fake, Config::default());
+        e.resync().await;
+        let next = e.next_upcoming().expect("a live event");
+        assert_eq!(next.start, soon.start);
+    }
+
+    #[tokio::test]
+    async fn next_upcoming_skips_hidden_calendars() {
+        let mut config = Config::default();
+        config.calendars.entry("p".into()).or_default().visible = false;
+        let mut fake = FakeSource::new(vec![cal("p", true)]);
+        fake.events.insert(
+            "p".into(),
+            vec![occ("p", Local::now() + Duration::minutes(30), vec![])],
+        );
+        let (mut e, _rx, _d) = engine_with(fake, config);
+        e.resync().await;
+        assert!(e.next_upcoming().is_none());
     }
 
     // -- run_loop end-to-end -------------------------------------------------

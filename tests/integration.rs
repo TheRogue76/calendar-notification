@@ -110,6 +110,9 @@ impl CalendarSource for FakeSource {
     ) -> anyhow::Result<String> {
         Ok(event_id.into())
     }
+    async fn delete_event(&self, _calendar_id: &str, _event_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[tokio::test]
@@ -143,4 +146,5 @@ async fn calendar_source_trait_is_publicly_implementable() {
         src.update_event("primary", "evt", &new).await.unwrap(),
         "evt"
     );
+    src.delete_event("primary", "evt").await.unwrap();
 }

@@ -38,7 +38,7 @@ run: build ## Build then run the app
 install: build install-desktop ## Build + install binary, icon, and desktop entry
 	install -Dm755 $(TARGET) $(BINDIR)/$(BIN)
 	@echo "Installed $(BIN) to $(BINDIR) (ensure it is on your PATH)."
-
+	$(MAKE) install-service
 install-desktop: ## Install just the icon + desktop entry (no build)
 	install -Dm644 assets/$(BIN).svg $(ICONDIR)/$(BIN).svg
 	install -Dm644 assets/$(BIN).desktop $(APPDIR)/$(BIN).desktop
