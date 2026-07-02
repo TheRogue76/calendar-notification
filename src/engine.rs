@@ -7,20 +7,35 @@
 //! for making ksni + iced coexist cleanly.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
+use anyhow::Result;
 use chrono::{DateTime, Duration, Local, Utc};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::{Duration as TokioDuration, Instant};
 use tracing::{error, info, warn};
 
 use crate::config::Config;
-use crate::google::client::GoogleClient;
 use crate::google::model::{Calendar, NewEvent, Occurrence};
 use crate::notify;
 use crate::tray::CalTray;
 
 /// Reminders window: how far ahead we fetch occurrences for scheduling.
 const REMINDER_WINDOW_HOURS: i64 = 48;
+
+/// The calendar data source the engine talks to. Implemented by the real
+/// `GoogleClient`; a fake implementation drives the engine in tests.
+#[allow(async_fn_in_trait)]
+pub trait CalendarSource {
+    async fn list_calendars(&self) -> Result<Vec<Calendar>>;
+    async fn list_events(
+        &self,
+        calendar_id: &str,
+        time_min: DateTime<Utc>,
+        time_max: DateTime<Utc>,
+    ) -> Result<Vec<Occurrence>>;
+    async fn insert_event(&self, new: &NewEvent) -> Result<String>;
+}
 
 /// Messages flowing from the engine to the UI (bridged into an iced subscription).
 #[derive(Debug, Clone)]
@@ -67,19 +82,33 @@ pub enum Command {
     Quit,
 }
 
-struct Engine {
+struct Engine<C: CalendarSource> {
     config: Config,
-    client: GoogleClient,
+    client: C,
     ui_tx: UnboundedSender<UiEvent>,
     /// Live tray handle, used to refresh the calendar submenu.
     tray: Option<ksni::Handle<CalTray>>,
+    /// Where to persist config. `None` = the default XDG path; tests inject a
+    /// temp path so they never touch the user's real config.
+    config_path: Option<PathBuf>,
     calendars: Vec<Calendar>,
     occurrences: Vec<Occurrence>,
     /// Dedup set of already-fired reminders (occurrence_key + minutes).
     fired: HashSet<String>,
 }
 
-impl Engine {
+impl<C: CalendarSource> Engine<C> {
+    /// Persist config to the injected path (tests) or the default XDG location.
+    fn save_config(&self) {
+        let result = match &self.config_path {
+            Some(p) => self.config.save_to(p),
+            None => self.config.save(),
+        };
+        if let Err(e) = result {
+            warn!("could not persist config: {e:#}");
+        }
+    }
+
     fn emit(&self, ev: UiEvent) {
         // The UI may not be listening yet on early events; ignore send errors.
         let _ = self.ui_tx.send(ev);
@@ -125,9 +154,7 @@ impl Engine {
                 for c in &cals {
                     self.config.ensure_calendar(&c.id, &c.color);
                 }
-                if let Err(e) = self.config.save() {
-                    warn!("could not persist config: {e:#}");
-                }
+                self.save_config();
                 self.calendars = cals;
             }
             Err(e) => {
@@ -247,13 +274,13 @@ impl Engine {
             Command::ToggleWidget => self.emit(UiEvent::ToggleWidget),
             Command::SetVisible(id, v) => {
                 self.config.calendars.entry(id).or_default().visible = v;
-                let _ = self.config.save();
+                self.save_config();
                 self.publish_calendars().await;
                 self.resync().await;
             }
             Command::SetNotify(id, v) => {
                 self.config.calendars.entry(id).or_default().notify = v;
-                let _ = self.config.save();
+                self.save_config();
                 self.publish_calendars().await;
             }
             Command::InsertEvent(new) => {
@@ -286,24 +313,39 @@ fn deadline_for(fire: DateTime<Utc>) -> Instant {
 }
 
 /// Run the engine loop until a Quit command. Consumes the command receiver.
-pub async fn run(
+pub async fn run<C: CalendarSource>(
     config: Config,
-    client: GoogleClient,
+    client: C,
     ui_tx: UnboundedSender<UiEvent>,
-    mut cmd_rx: UnboundedReceiver<Command>,
+    cmd_rx: UnboundedReceiver<Command>,
     tray: Option<ksni::Handle<CalTray>>,
 ) {
-    let poll_every =
-        TokioDuration::from_secs(config.poll_interval_minutes.max(1).saturating_mul(60));
-    let mut engine = Engine {
+    let engine = Engine {
         config,
         client,
         ui_tx,
         tray,
+        config_path: None,
         calendars: Vec::new(),
         occurrences: Vec::new(),
         fired: HashSet::new(),
     };
+    run_loop(engine, cmd_rx).await;
+}
+
+/// The engine's event loop, split out so tests can drive a hand-built engine
+/// (with a fake source and an injected config path).
+async fn run_loop<C: CalendarSource>(
+    mut engine: Engine<C>,
+    mut cmd_rx: UnboundedReceiver<Command>,
+) {
+    let poll_every = TokioDuration::from_secs(
+        engine
+            .config
+            .poll_interval_minutes
+            .max(1)
+            .saturating_mul(60),
+    );
 
     engine.resync().await;
 
@@ -347,4 +389,322 @@ pub async fn run(
     }
 
     info!("engine loop exited");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::CalendarPrefs;
+    use crate::google::model::ReminderRule;
+    use chrono::TimeZone;
+    use std::sync::Mutex;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    // -- fake source ---------------------------------------------------------
+
+    struct FakeSource {
+        calendars: Vec<Calendar>,
+        events: std::collections::HashMap<String, Vec<Occurrence>>,
+        inserted: Mutex<Vec<NewEvent>>,
+        fail_calendars: bool,
+    }
+
+    impl FakeSource {
+        fn new(calendars: Vec<Calendar>) -> Self {
+            Self {
+                calendars,
+                events: std::collections::HashMap::new(),
+                inserted: Mutex::new(Vec::new()),
+                fail_calendars: false,
+            }
+        }
+    }
+
+    impl CalendarSource for FakeSource {
+        async fn list_calendars(&self) -> Result<Vec<Calendar>> {
+            if self.fail_calendars {
+                anyhow::bail!("offline");
+            }
+            Ok(self.calendars.clone())
+        }
+        async fn list_events(
+            &self,
+            calendar_id: &str,
+            _min: DateTime<Utc>,
+            _max: DateTime<Utc>,
+        ) -> Result<Vec<Occurrence>> {
+            Ok(self.events.get(calendar_id).cloned().unwrap_or_default())
+        }
+        async fn insert_event(&self, new: &NewEvent) -> Result<String> {
+            self.inserted.lock().unwrap().push(new.clone());
+            Ok("new-id".into())
+        }
+    }
+
+    // -- builders ------------------------------------------------------------
+
+    fn cal(id: &str, primary: bool) -> Calendar {
+        Calendar {
+            id: id.into(),
+            summary: id.to_uppercase(),
+            color: "#112233".into(),
+            primary,
+        }
+    }
+
+    fn occ(cal_id: &str, start: DateTime<Local>, reminders: Vec<i64>) -> Occurrence {
+        Occurrence {
+            event_id: format!("evt-{cal_id}"),
+            calendar_id: cal_id.into(),
+            title: "T".into(),
+            location: None,
+            start,
+            end: start,
+            all_day: false,
+            reminders: reminders
+                .into_iter()
+                .map(|m| ReminderRule { minutes: m })
+                .collect(),
+        }
+    }
+
+    fn engine_with(
+        client: FakeSource,
+        config: Config,
+    ) -> (
+        Engine<FakeSource>,
+        UnboundedReceiver<UiEvent>,
+        tempfile::TempDir,
+    ) {
+        let (ui_tx, ui_rx) = unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine {
+            config,
+            client,
+            ui_tx,
+            tray: None,
+            config_path: Some(dir.path().join("config.toml")),
+            calendars: Vec::new(),
+            occurrences: Vec::new(),
+            fired: HashSet::new(),
+        };
+        (engine, ui_rx, dir)
+    }
+
+    fn drain(rx: &mut UnboundedReceiver<UiEvent>) -> Vec<UiEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    // -- deadline_for --------------------------------------------------------
+
+    #[test]
+    fn deadline_for_past_is_immediate() {
+        let past = Utc::now() - Duration::hours(1);
+        let d = deadline_for(past);
+        assert!(d <= Instant::now() + TokioDuration::from_millis(5));
+    }
+
+    #[test]
+    fn deadline_for_future_is_later() {
+        let future = Utc::now() + Duration::seconds(60);
+        assert!(deadline_for(future) > Instant::now() + TokioDuration::from_secs(30));
+    }
+
+    // -- next_reminder / notify_enabled / prune_fired ------------------------
+
+    #[test]
+    fn next_reminder_none_when_empty() {
+        let (e, _rx, _d) = engine_with(FakeSource::new(vec![]), Config::default());
+        assert!(e.next_reminder().is_none());
+    }
+
+    #[test]
+    fn next_reminder_picks_earliest_future_and_skips_stale_and_fired() {
+        let (mut e, _rx, _d) = engine_with(FakeSource::new(vec![]), Config::default());
+        e.calendars = vec![cal("p", true)];
+        let now = Local::now();
+        e.occurrences = vec![
+            // stale: fired 10 min ago (start 9 min ago, 1 min lead) -> skipped
+            occ("p", now - Duration::minutes(9), vec![1]),
+            // future in 60 min (start +120, lead 60)
+            occ("p", now + Duration::minutes(120), vec![60]),
+            // sooner: future in 30 min (start +40, lead 10)
+            occ("p", now + Duration::minutes(40), vec![10]),
+        ];
+        let (_, idx, minutes, key) = e.next_reminder().expect("a reminder");
+        assert_eq!(minutes, 10, "closest reminder wins");
+        assert_eq!(idx, 2);
+
+        // Once that key is fired, the next call returns the later one.
+        e.fired.insert(key);
+        let (_, _, minutes2, _) = e.next_reminder().unwrap();
+        assert_eq!(minutes2, 60);
+    }
+
+    #[test]
+    fn next_reminder_skips_notify_disabled_calendar() {
+        let mut config = Config::default();
+        config.calendars.insert(
+            "p".into(),
+            CalendarPrefs {
+                visible: true,
+                notify: false,
+                color: String::new(),
+            },
+        );
+        let (mut e, _rx, _d) = engine_with(FakeSource::new(vec![]), config);
+        e.calendars = vec![cal("p", true)];
+        e.occurrences = vec![occ("p", Local::now() + Duration::hours(1), vec![10])];
+        assert!(e.next_reminder().is_none());
+    }
+
+    #[test]
+    fn prune_fired_drops_dead_keys() {
+        let (mut e, _rx, _d) = engine_with(FakeSource::new(vec![]), Config::default());
+        let live = occ("p", Local::now() + Duration::hours(1), vec![10]);
+        let live_key = format!("{}::10", live.occurrence_key());
+        e.occurrences = vec![live];
+        e.fired.insert(live_key.clone());
+        e.fired
+            .insert("evt-gone::2026-01-01T00:00:00+00:00::5".into());
+        e.prune_fired();
+        assert!(e.fired.contains(&live_key));
+        assert_eq!(e.fired.len(), 1);
+    }
+
+    // -- publish_calendars ---------------------------------------------------
+
+    #[tokio::test]
+    async fn publish_calendars_applies_prefs() {
+        let mut config = Config::default();
+        config.calendars.insert(
+            "p".into(),
+            CalendarPrefs {
+                visible: false,
+                notify: true,
+                color: "#abcdef".into(),
+            },
+        );
+        let (mut e, mut rx, _d) = engine_with(FakeSource::new(vec![]), config);
+        e.calendars = vec![cal("p", true)];
+        e.publish_calendars().await;
+        let events = drain(&mut rx);
+        match &events[0] {
+            UiEvent::Calendars(v) => {
+                assert_eq!(v[0].color, "#abcdef"); // config color overrides
+                assert!(!v[0].visible);
+            }
+            other => panic!("expected Calendars, got {other:?}"),
+        }
+    }
+
+    // -- resync --------------------------------------------------------------
+
+    #[tokio::test]
+    async fn resync_populates_and_persists() {
+        let mut fake = FakeSource::new(vec![cal("p", true)]);
+        fake.events.insert(
+            "p".into(),
+            vec![occ("p", Local::now() + Duration::hours(3), vec![10])],
+        );
+        let (mut e, mut rx, dir) = engine_with(fake, Config::default());
+        e.resync().await;
+
+        assert_eq!(e.calendars.len(), 1);
+        assert_eq!(e.occurrences.len(), 1);
+        assert!(
+            dir.path().join("config.toml").exists(),
+            "config persisted to temp path"
+        );
+        let evs = drain(&mut rx);
+        assert!(evs.iter().any(|ev| matches!(ev, UiEvent::Calendars(_))));
+        assert!(evs.iter().any(|ev| matches!(ev, UiEvent::Occurrences(_))));
+    }
+
+    #[tokio::test]
+    async fn resync_offline_emits_status_and_keeps_state() {
+        let mut fake = FakeSource::new(vec![]);
+        fake.fail_calendars = true;
+        let (mut e, mut rx, _d) = engine_with(fake, Config::default());
+        e.resync().await;
+        assert!(e.calendars.is_empty());
+        let evs = drain(&mut rx);
+        assert!(evs
+            .iter()
+            .any(|ev| matches!(ev, UiEvent::Status(s) if s.contains("Offline"))));
+    }
+
+    // -- handle_command ------------------------------------------------------
+
+    #[tokio::test]
+    async fn handle_toggle_and_quit() {
+        let (mut e, mut rx, _d) = engine_with(FakeSource::new(vec![]), Config::default());
+        assert!(e.handle_command(Command::ToggleWidget).await);
+        assert!(
+            !e.handle_command(Command::Quit).await,
+            "Quit stops the loop"
+        );
+        let evs = drain(&mut rx);
+        assert!(evs.iter().any(|ev| matches!(ev, UiEvent::ToggleWidget)));
+        assert!(evs.iter().any(|ev| matches!(ev, UiEvent::Quit)));
+    }
+
+    #[tokio::test]
+    async fn handle_set_visible_updates_config() {
+        let (mut e, _rx, _d) =
+            engine_with(FakeSource::new(vec![cal("p", true)]), Config::default());
+        e.handle_command(Command::SetVisible("p".into(), false))
+            .await;
+        assert!(!e.config.calendars["p"].visible);
+        e.handle_command(Command::SetNotify("p".into(), false))
+            .await;
+        assert!(!e.config.calendars["p"].notify);
+    }
+
+    #[tokio::test]
+    async fn handle_insert_event_records_and_reports() {
+        let (mut e, mut rx, _d) =
+            engine_with(FakeSource::new(vec![cal("p", true)]), Config::default());
+        let new = NewEvent {
+            calendar_id: "p".into(),
+            title: "New".into(),
+            location: None,
+            description: None,
+            all_day: false,
+            start: Local.with_ymd_and_hms(2026, 7, 2, 9, 0, 0).unwrap(),
+            end: Local.with_ymd_and_hms(2026, 7, 2, 10, 0, 0).unwrap(),
+            attendees: vec![],
+            recurrence: vec![],
+        };
+        e.handle_command(Command::InsertEvent(new)).await;
+        assert_eq!(e.client.inserted.lock().unwrap().len(), 1);
+        let evs = drain(&mut rx);
+        assert!(evs
+            .iter()
+            .any(|ev| matches!(ev, UiEvent::EventCreated(Ok(_)))));
+    }
+
+    // -- run_loop end-to-end -------------------------------------------------
+
+    #[tokio::test]
+    async fn run_loop_processes_commands_then_quits() {
+        let mut fake = FakeSource::new(vec![cal("p", true)]);
+        // Future reminder so the scheduler arm never fires (no real notification).
+        fake.events.insert(
+            "p".into(),
+            vec![occ("p", Local::now() + Duration::hours(5), vec![10])],
+        );
+        let (e, mut ui_rx, _d) = engine_with(fake, Config::default());
+        let (cmd_tx, cmd_rx) = unbounded_channel();
+        cmd_tx.send(Command::SyncNow).unwrap();
+        cmd_tx.send(Command::Quit).unwrap();
+        run_loop(e, cmd_rx).await;
+        let evs = drain(&mut ui_rx);
+        assert!(evs.iter().any(|ev| matches!(ev, UiEvent::Occurrences(_))));
+        assert!(evs.iter().any(|ev| matches!(ev, UiEvent::Quit)));
+    }
 }

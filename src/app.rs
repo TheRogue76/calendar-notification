@@ -219,3 +219,174 @@ fn engine_events() -> impl Stream<Item = Message> {
 fn _assert_element(app: &App) -> Element<'_, Message> {
     text(app.status.clone()).into()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::add_event::FormMsg;
+    use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+
+    fn app() -> (App, UnboundedReceiver<Command>) {
+        let (tx, rx) = unbounded_channel();
+        (App::new(tx), rx)
+    }
+
+    fn cal(id: &str, primary: bool) -> CalendarView {
+        CalendarView {
+            id: id.into(),
+            summary: id.into(),
+            color: String::new(),
+            primary,
+            visible: true,
+            notify: true,
+        }
+    }
+
+    #[test]
+    fn calendars_event_sets_state_and_defaults_form_calendar() {
+        let (mut a, _rx) = app();
+        let _ = update(
+            &mut a,
+            Message::Engine(UiEvent::Calendars(vec![cal("a", false), cal("p", true)])),
+        );
+        assert_eq!(a.calendars.len(), 2);
+        assert_eq!(a.form.calendar_id.as_deref(), Some("p")); // primary chosen
+    }
+
+    #[test]
+    fn occurrences_event_sets_state() {
+        let (mut a, _rx) = app();
+        let _ = update(&mut a, Message::Engine(UiEvent::Occurrences(vec![])));
+        assert!(a.occurrences.is_empty());
+        let _ = update(&mut a, Message::Engine(UiEvent::Status("Synced".into())));
+        assert_eq!(a.status, "Synced");
+    }
+
+    #[test]
+    fn event_created_ok_resets_and_closes_form() {
+        let (mut a, _rx) = app();
+        a.form.open = true;
+        a.form.submitting = true;
+        a.form.title = "x".into();
+        let _ = update(
+            &mut a,
+            Message::Engine(UiEvent::EventCreated(Ok("id".into()))),
+        );
+        assert!(!a.form.open);
+        assert!(!a.form.submitting);
+        assert!(a.form.title.is_empty());
+        assert_eq!(a.status, "Event created");
+    }
+
+    #[test]
+    fn event_created_err_surfaces_error() {
+        let (mut a, _rx) = app();
+        a.form.submitting = true;
+        let _ = update(
+            &mut a,
+            Message::Engine(UiEvent::EventCreated(Err("bad".into()))),
+        );
+        assert!(!a.form.submitting);
+        assert_eq!(a.form.error.as_deref(), Some("bad"));
+    }
+
+    #[test]
+    fn toggle_widget_opens_then_closes() {
+        let (mut a, _rx) = app();
+        assert!(a.widget.is_none());
+        let _ = update(&mut a, Message::Engine(UiEvent::ToggleWidget));
+        let id = a.widget.expect("widget should be open");
+        // Closing again clears it.
+        let _ = update(&mut a, Message::Engine(UiEvent::ToggleWidget));
+        assert!(a.widget.is_none());
+        // A WindowClosed for the (now-stale) id is a no-op.
+        let _ = update(&mut a, Message::WindowClosed(id));
+        assert!(a.widget.is_none());
+    }
+
+    #[test]
+    fn window_closed_clears_matching_widget() {
+        let (mut a, _rx) = app();
+        let _ = update(&mut a, Message::Engine(UiEvent::ToggleWidget));
+        let id = a.widget.unwrap();
+        let _ = update(&mut a, Message::WindowClosed(id));
+        assert!(a.widget.is_none());
+    }
+
+    #[test]
+    fn sync_now_sends_command() {
+        let (mut a, mut rx) = app();
+        let _ = update(&mut a, Message::SyncNow);
+        assert!(matches!(rx.try_recv(), Ok(Command::SyncNow)));
+    }
+
+    #[test]
+    fn open_and_close_add_form() {
+        let (mut a, _rx) = app();
+        a.form.error = Some("old".into());
+        let _ = update(&mut a, Message::OpenAddForm);
+        assert!(a.form.open);
+        assert!(a.form.error.is_none());
+        let _ = update(&mut a, Message::CloseAddForm);
+        assert!(!a.form.open);
+    }
+
+    #[test]
+    fn form_message_is_delegated() {
+        let (mut a, _rx) = app();
+        let _ = update(&mut a, Message::Form(FormMsg::Title("Hello".into())));
+        assert_eq!(a.form.title, "Hello");
+    }
+
+    #[test]
+    fn submit_valid_form_sends_insert_and_marks_submitting() {
+        let (mut a, mut rx) = app();
+        a.calendars = vec![cal("p", true)];
+        a.form.calendar_id = Some("p".into());
+        a.form.title = "Standup".into();
+        a.form.start_date = "2026-07-02".into();
+        a.form.start_time = "09:00".into();
+        a.form.end_date = "2026-07-02".into();
+        a.form.end_time = "09:30".into();
+        let _ = update(&mut a, Message::SubmitForm);
+        assert!(a.form.submitting);
+        assert!(matches!(rx.try_recv(), Ok(Command::InsertEvent(_))));
+    }
+
+    #[test]
+    fn submit_invalid_form_sets_error_no_command() {
+        let (mut a, mut rx) = app();
+        // no title -> build fails
+        let _ = update(&mut a, Message::SubmitForm);
+        assert!(!a.form.submitting);
+        assert!(a.form.error.is_some());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn set_calendar_visible_sends_command() {
+        let (mut a, mut rx) = app();
+        let _ = update(&mut a, Message::SetCalendarVisible("c1".into(), false));
+        match rx.try_recv() {
+            Ok(Command::SetVisible(id, v)) => {
+                assert_eq!(id, "c1");
+                assert!(!v);
+            }
+            other => panic!("expected SetVisible, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn view_and_metadata_helpers_run() {
+        let (mut a, _rx) = app();
+        let _ = update(&mut a, Message::Engine(UiEvent::ToggleWidget));
+        let id = a.widget.unwrap();
+        // Agenda mode.
+        let _ = view(&a, id);
+        // Form mode.
+        a.form.open = true;
+        let _ = view(&a, id);
+        assert_eq!(title(&a, id), "Calendar");
+        let _ = theme(&a, id);
+    }
+}

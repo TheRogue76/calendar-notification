@@ -388,6 +388,7 @@ dependencies = [
  "notify-rust",
  "rustls",
  "serde",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",

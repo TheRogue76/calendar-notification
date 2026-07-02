@@ -36,9 +36,11 @@ impl GoogleClient {
             hub: CalendarHub::new(client, auth),
         }
     }
+}
 
+impl crate::engine::CalendarSource for GoogleClient {
     /// All calendars the user can see.
-    pub async fn list_calendars(&self) -> Result<Vec<Calendar>> {
+    async fn list_calendars(&self) -> Result<Vec<Calendar>> {
         let (_resp, list) = self
             .hub
             .calendar_list()
@@ -76,7 +78,7 @@ impl GoogleClient {
     /// List occurrences in `[time_min, time_max)` for one calendar. Recurring
     /// events are expanded server-side (`single_events(true)`), so each item is
     /// already a concrete instance carrying its own reminder settings.
-    pub async fn list_events(
+    async fn list_events(
         &self,
         calendar_id: &str,
         time_min: DateTime<Utc>,
@@ -121,7 +123,7 @@ impl GoogleClient {
     }
 
     /// Create a new event; returns the created event id.
-    pub async fn insert_event(&self, new: &NewEvent) -> Result<String> {
+    async fn insert_event(&self, new: &NewEvent) -> Result<String> {
         let event = build_event(new);
         let (_resp, created) = self
             .hub
@@ -144,7 +146,9 @@ impl GoogleClient {
 /// the server routes to `Calendars.Get`. Encoding `#`/`?`/`%` ourselves keeps
 /// the id intact; the server decodes it back.
 fn encode_calendar_id(id: &str) -> String {
-    id.replace('%', "%25").replace('#', "%23").replace('?', "%3F")
+    id.replace('%', "%25")
+        .replace('#', "%23")
+        .replace('?', "%3F")
 }
 
 /// Convert Google reminder overrides to our popup-only rules.
@@ -289,7 +293,10 @@ fn build_event(new: &NewEvent) -> Event {
 
 #[cfg(test)]
 mod tests {
-    use super::encode_calendar_id;
+    use super::*;
+    use chrono::{NaiveDate, TimeZone};
+
+    // -- encode_calendar_id --------------------------------------------------
 
     #[test]
     fn encodes_hash_in_holiday_calendar_id() {
@@ -306,5 +313,213 @@ mod tests {
             encode_calendar_id("abc@group.calendar.google.com"),
             "abc@group.calendar.google.com"
         );
+    }
+
+    #[test]
+    fn encodes_percent_and_question() {
+        assert_eq!(encode_calendar_id("a%b?c"), "a%25b%3Fc");
+    }
+
+    // -- reminder_rules ------------------------------------------------------
+
+    fn reminder(method: Option<&str>, minutes: Option<i32>) -> EventReminder {
+        EventReminder {
+            method: method.map(|s| s.to_string()),
+            minutes,
+        }
+    }
+
+    #[test]
+    fn reminder_rules_keeps_popup_and_untyped_skips_email() {
+        let rs = vec![
+            reminder(Some("popup"), Some(10)),
+            reminder(Some("email"), Some(60)),
+            reminder(None, Some(5)),       // untyped treated as popup
+            reminder(Some("popup"), None), // no minutes -> dropped
+        ];
+        let out = reminder_rules(Some(&rs));
+        assert_eq!(
+            out,
+            vec![ReminderRule { minutes: 10 }, ReminderRule { minutes: 5 }]
+        );
+    }
+
+    #[test]
+    fn reminder_rules_none_is_empty() {
+        assert!(reminder_rules(None).is_empty());
+    }
+
+    // -- parse_start / parse_end --------------------------------------------
+
+    #[test]
+    fn parse_start_timed_is_not_all_day() {
+        let dt = Utc.with_ymd_and_hms(2026, 7, 2, 8, 0, 0).unwrap();
+        let edt = EventDateTime {
+            date_time: Some(dt),
+            date: None,
+            time_zone: None,
+        };
+        let (start, all_day) = parse_start(Some(&edt)).unwrap();
+        assert!(!all_day);
+        assert_eq!(start, dt.with_timezone(&Local));
+    }
+
+    #[test]
+    fn parse_start_date_is_all_day() {
+        let d = NaiveDate::from_ymd_opt(2026, 7, 2).unwrap();
+        let edt = EventDateTime {
+            date_time: None,
+            date: Some(d),
+            time_zone: None,
+        };
+        let (_start, all_day) = parse_start(Some(&edt)).unwrap();
+        assert!(all_day);
+    }
+
+    #[test]
+    fn parse_start_none_and_empty() {
+        assert!(parse_start(None).is_none());
+        let empty = EventDateTime {
+            date_time: None,
+            date: None,
+            time_zone: None,
+        };
+        assert!(parse_start(Some(&empty)).is_none());
+        assert!(parse_end(Some(&empty)).is_none());
+    }
+
+    // -- to_occurrence -------------------------------------------------------
+
+    fn timed_event(id: Option<&str>) -> Event {
+        let dt = Utc.with_ymd_and_hms(2026, 7, 2, 8, 0, 0).unwrap();
+        Event {
+            id: id.map(|s| s.to_string()),
+            summary: Some("Meeting".into()),
+            location: Some("Room".into()),
+            start: Some(EventDateTime {
+                date_time: Some(dt),
+                date: None,
+                time_zone: None,
+            }),
+            end: Some(EventDateTime {
+                date_time: Some(dt + chrono::Duration::hours(1)),
+                date: None,
+                time_zone: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn to_occurrence_missing_id_is_none() {
+        assert!(to_occurrence("cal", timed_event(None), &[]).is_none());
+    }
+
+    #[test]
+    fn to_occurrence_uses_calendar_defaults_when_use_default() {
+        let ev = timed_event(Some("e1"));
+        let defaults = vec![ReminderRule { minutes: 15 }];
+        let occ = to_occurrence("cal", ev, &defaults).unwrap();
+        assert_eq!(occ.event_id, "e1");
+        assert_eq!(occ.calendar_id, "cal");
+        assert!(!occ.all_day);
+        assert_eq!(occ.reminders, defaults);
+    }
+
+    #[test]
+    fn to_occurrence_overrides_win_over_defaults() {
+        let mut ev = timed_event(Some("e1"));
+        ev.reminders = Some(EventReminders {
+            use_default: Some(false),
+            overrides: Some(vec![reminder(Some("popup"), Some(2))]),
+        });
+        let occ = to_occurrence("cal", ev, &[ReminderRule { minutes: 15 }]).unwrap();
+        assert_eq!(occ.reminders, vec![ReminderRule { minutes: 2 }]);
+    }
+
+    #[test]
+    fn to_occurrence_missing_summary_gets_placeholder() {
+        let mut ev = timed_event(Some("e1"));
+        ev.summary = None;
+        let occ = to_occurrence("cal", ev, &[]).unwrap();
+        assert_eq!(occ.title, "(no title)");
+    }
+
+    // -- build_event ---------------------------------------------------------
+
+    fn local(y: i32, m: u32, d: u32, h: u32, min: u32) -> chrono::DateTime<Local> {
+        Local.with_ymd_and_hms(y, m, d, h, min, 0).unwrap()
+    }
+
+    fn base_new() -> NewEvent {
+        NewEvent {
+            calendar_id: "primary".into(),
+            title: "Title".into(),
+            location: Some("Loc".into()),
+            description: Some("Desc".into()),
+            all_day: false,
+            start: local(2026, 7, 2, 9, 0),
+            end: local(2026, 7, 2, 10, 0),
+            attendees: vec![],
+            recurrence: vec![],
+        }
+    }
+
+    #[test]
+    fn build_event_timed_uses_utc_datetime() {
+        let ev = build_event(&base_new());
+        let start = ev.start.unwrap();
+        assert!(start.date.is_none());
+        assert_eq!(
+            start.date_time.unwrap(),
+            local(2026, 7, 2, 9, 0).with_timezone(&Utc)
+        );
+        assert_eq!(ev.summary.unwrap(), "Title");
+        assert_eq!(ev.location.unwrap(), "Loc");
+        assert!(ev.attendees.is_none());
+        assert!(ev.recurrence.is_none());
+    }
+
+    #[test]
+    fn build_event_all_day_end_is_exclusive() {
+        let mut n = base_new();
+        n.all_day = true;
+        n.start = local(2026, 7, 2, 0, 0);
+        n.end = local(2026, 7, 2, 0, 0); // same day
+        let ev = build_event(&n);
+        assert_eq!(
+            ev.start.unwrap().date.unwrap(),
+            NaiveDate::from_ymd_opt(2026, 7, 2).unwrap()
+        );
+        // exclusive end bumped to next day
+        assert_eq!(
+            ev.end.unwrap().date.unwrap(),
+            NaiveDate::from_ymd_opt(2026, 7, 3).unwrap()
+        );
+    }
+
+    #[test]
+    fn build_event_multiday_all_day_preserves_end() {
+        let mut n = base_new();
+        n.all_day = true;
+        n.start = local(2026, 7, 2, 0, 0);
+        n.end = local(2026, 7, 5, 0, 0);
+        let ev = build_event(&n);
+        assert_eq!(
+            ev.end.unwrap().date.unwrap(),
+            NaiveDate::from_ymd_opt(2026, 7, 5).unwrap()
+        );
+    }
+
+    #[test]
+    fn build_event_maps_attendees_and_recurrence() {
+        let mut n = base_new();
+        n.attendees = vec!["a@x.com".into(), "b@y.com".into()];
+        n.recurrence = vec!["RRULE:FREQ=DAILY".into()];
+        let ev = build_event(&n);
+        let att = ev.attendees.unwrap();
+        assert_eq!(att.len(), 2);
+        assert_eq!(att[0].email.as_deref(), Some("a@x.com"));
+        assert_eq!(ev.recurrence.unwrap(), vec!["RRULE:FREQ=DAILY".to_string()]);
     }
 }

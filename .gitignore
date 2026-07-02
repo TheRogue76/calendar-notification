@@ -26,3 +26,7 @@ client_secret*.json
 
 # Logs
 *.log
+
+# Coverage artifacts (cargo-llvm-cov)
+*.profraw
+/lcov.info

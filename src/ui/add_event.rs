@@ -406,3 +406,203 @@ fn local_midnight(date: NaiveDate) -> Result<chrono::DateTime<Local>, String> {
     let midnight = NaiveTime::from_hms_opt(0, 0, 0).expect("00:00:00 is a valid time");
     local_datetime(date, midnight)
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::field_reassign_with_default)]
+    use super::*;
+
+    fn cals() -> Vec<CalendarView> {
+        vec![
+            CalendarView {
+                id: "p".into(),
+                summary: "Primary".into(),
+                color: "#ffffff".into(),
+                primary: true,
+                visible: true,
+                notify: true,
+            },
+            CalendarView {
+                id: "w".into(),
+                summary: "Work".into(),
+                color: "#0000ff".into(),
+                primary: false,
+                visible: true,
+                notify: true,
+            },
+        ]
+    }
+
+    /// A deterministic, valid timed form (doesn't depend on wall-clock).
+    fn valid_form() -> FormState {
+        let mut f = FormState::default();
+        f.title = "Standup".into();
+        f.start_date = "2026-07-02".into();
+        f.start_time = "09:00".into();
+        f.end_date = "2026-07-02".into();
+        f.end_time = "09:30".into();
+        f
+    }
+
+    #[test]
+    fn build_requires_title() {
+        let f = FormState::default();
+        assert_eq!(f.build(&cals()).unwrap_err(), "Title is required");
+    }
+
+    #[test]
+    fn build_valid_timed_event() {
+        let ev = valid_form().build(&cals()).unwrap();
+        assert_eq!(ev.title, "Standup");
+        assert_eq!(ev.calendar_id, "p"); // defaults to primary
+        assert!(!ev.all_day);
+        assert!(ev.recurrence.is_empty());
+        assert!(ev.end > ev.start);
+    }
+
+    #[test]
+    fn build_defaults_to_primary_then_first() {
+        let mut f = valid_form();
+        f.calendar_id = None;
+        // primary present -> "p"
+        assert_eq!(f.build(&cals()).unwrap().calendar_id, "p");
+        // no primary -> first
+        let no_primary = vec![CalendarView {
+            id: "only".into(),
+            summary: "Only".into(),
+            color: String::new(),
+            primary: false,
+            visible: true,
+            notify: true,
+        }];
+        assert_eq!(f.build(&no_primary).unwrap().calendar_id, "only");
+    }
+
+    #[test]
+    fn build_no_calendar_errors() {
+        let mut f = valid_form();
+        f.calendar_id = None;
+        assert_eq!(f.build(&[]).unwrap_err(), "No calendar available");
+    }
+
+    #[test]
+    fn build_rejects_bad_dates_times_and_ordering() {
+        let mut f = valid_form();
+        f.start_date = "nope".into();
+        assert!(f.build(&cals()).unwrap_err().contains("start date"));
+
+        let mut f = valid_form();
+        f.start_time = "25:99".into();
+        assert!(f.build(&cals()).unwrap_err().contains("start time"));
+
+        let mut f = valid_form();
+        f.end_time = "08:00".into(); // before start
+        assert_eq!(f.build(&cals()).unwrap_err(), "End must be after start");
+    }
+
+    #[test]
+    fn build_all_day_ignores_time() {
+        let mut f = valid_form();
+        f.all_day = true;
+        f.end_time = "00:00".into(); // would be invalid for timed, fine for all-day
+        let ev = f.build(&cals()).unwrap();
+        assert!(ev.all_day);
+    }
+
+    #[test]
+    fn build_parses_attendees_and_recurrence() {
+        let mut f = valid_form();
+        f.guests = " a@x.com , ,b@y.com ".into();
+        f.location = "  ".into(); // blank -> None
+        f.description = "note".into();
+        f.recurrence = RecurrenceKind::Weekly;
+        f.weekdays = Weekdays {
+            days: [true, false, false, false, false, false, false],
+        };
+        f.until_enabled = true;
+        f.until_date = "2026-12-31".into();
+        let ev = f.build(&cals()).unwrap();
+        assert_eq!(
+            ev.attendees,
+            vec!["a@x.com".to_string(), "b@y.com".to_string()]
+        );
+        assert!(ev.location.is_none());
+        assert_eq!(ev.description.as_deref(), Some("note"));
+        assert_eq!(
+            ev.recurrence,
+            vec!["RRULE:FREQ=WEEKLY;BYDAY=MO;UNTIL=20261231T235959Z"]
+        );
+    }
+
+    #[test]
+    fn update_sets_fields_and_clears_error() {
+        let mut f = FormState::default();
+        f.error = Some("stale".into());
+        f.update(FormMsg::Title("Hi".into()));
+        assert_eq!(f.title, "Hi");
+        assert!(f.error.is_none());
+        f.update(FormMsg::AllDay(true));
+        assert!(f.all_day);
+        f.update(FormMsg::ToggleWeekday(2, true));
+        assert!(f.weekdays.days[2]);
+        f.update(FormMsg::ToggleWeekday(99, true)); // out of range -> ignored
+        f.update(FormMsg::Calendar(CalendarChoice {
+            id: "w".into(),
+            name: "Work".into(),
+        }));
+        assert_eq!(f.calendar_id.as_deref(), Some("w"));
+        f.update(FormMsg::Recurrence(RecurrenceKind::Monthly));
+        assert_eq!(f.recurrence, RecurrenceKind::Monthly);
+        // remaining string setters
+        for m in [
+            FormMsg::StartDate("d".into()),
+            FormMsg::StartTime("t".into()),
+            FormMsg::EndDate("d".into()),
+            FormMsg::EndTime("t".into()),
+            FormMsg::Location("l".into()),
+            FormMsg::Description("desc".into()),
+            FormMsg::Guests("g".into()),
+            FormMsg::UntilEnabled(true),
+            FormMsg::UntilDate("2026-01-01".into()),
+        ] {
+            f.update(m);
+        }
+        assert!(f.until_enabled);
+    }
+
+    #[test]
+    fn reset_preserves_calendar() {
+        let mut f = valid_form();
+        f.calendar_id = Some("w".into());
+        f.reset();
+        assert_eq!(f.calendar_id.as_deref(), Some("w"));
+        assert!(f.title.is_empty());
+    }
+
+    #[test]
+    fn until_respects_toggle_and_validity() {
+        let mut f = FormState::default();
+        f.until_enabled = false;
+        assert!(f.until().is_none());
+        f.until_enabled = true;
+        f.until_date = "2026-12-31".into();
+        assert!(f.until().is_some());
+        f.until_date = "garbage".into();
+        assert!(f.until().is_none());
+    }
+
+    #[test]
+    fn view_builds_in_all_modes() {
+        // Timed, no recurrence.
+        let _ = view(&valid_form(), &cals());
+
+        // All-day, weekly recurrence with until, an error, and submitting.
+        let mut f = valid_form();
+        f.all_day = true;
+        f.recurrence = RecurrenceKind::Weekly;
+        f.until_enabled = true;
+        f.error = Some("boom".into());
+        f.submitting = true;
+        let _ = view(&f, &cals());
+    }
+}

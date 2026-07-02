@@ -138,4 +138,57 @@ mod tests {
             vec!["RRULE:FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=20261231T235959Z"]
         );
     }
+
+    #[test]
+    fn weekly_without_days_omits_byday() {
+        let wd = Weekdays::default();
+        assert_eq!(
+            Recurrence::Weekly(wd).to_rrule(None),
+            vec!["RRULE:FREQ=WEEKLY"]
+        );
+    }
+
+    #[test]
+    fn all_weekdays_serialize() {
+        let wd = Weekdays { days: [true; 7] };
+        assert_eq!(
+            Recurrence::Weekly(wd).to_rrule(None),
+            vec!["RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR,SA,SU"]
+        );
+    }
+
+    #[test]
+    fn monthly_and_yearly() {
+        assert_eq!(
+            Recurrence::Monthly.to_rrule(None),
+            vec!["RRULE:FREQ=MONTHLY"]
+        );
+        assert_eq!(Recurrence::Yearly.to_rrule(None), vec!["RRULE:FREQ=YEARLY"]);
+    }
+
+    #[test]
+    fn daily_with_until() {
+        let until = NaiveDate::from_ymd_opt(2027, 1, 1).unwrap();
+        assert_eq!(
+            Recurrence::Daily.to_rrule(Some(until)),
+            vec!["RRULE:FREQ=DAILY;UNTIL=20270101T235959Z"]
+        );
+    }
+
+    #[test]
+    fn from_date_selects_the_right_weekday() {
+        // 2026-07-02 is a Thursday -> index 3 (Mon=0).
+        let thursday = NaiveDate::from_ymd_opt(2026, 7, 2).unwrap();
+        let wd = Weekdays::from_date(thursday);
+        assert_eq!(wd.days, [false, false, false, true, false, false, false]);
+    }
+
+    #[test]
+    fn recurrence_kind_display() {
+        assert_eq!(RecurrenceKind::None.to_string(), "Does not repeat");
+        assert_eq!(RecurrenceKind::Daily.to_string(), "Daily");
+        assert_eq!(RecurrenceKind::Weekly.to_string(), "Weekly");
+        assert_eq!(RecurrenceKind::Monthly.to_string(), "Monthly");
+        assert_eq!(RecurrenceKind::Yearly.to_string(), "Yearly");
+    }
 }

@@ -4,7 +4,7 @@
 //! Stored as TOML at `~/.config/calendar-notification/config.toml`.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
@@ -87,32 +87,41 @@ impl Config {
 
     /// Load config from disk, creating a default file on first run.
     pub fn load_or_create() -> Result<Self> {
-        let path = config_path()?;
+        Self::load_or_create_at(&config_path()?)
+    }
+
+    /// Persist current config back to disk.
+    pub fn save(&self) -> Result<()> {
+        self.save_to(&config_path()?)
+    }
+
+    /// Load from (or create a default at) a specific path — the testable core
+    /// of [`Config::load_or_create`].
+    pub fn load_or_create_at(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating config dir {}", parent.display()))?;
         }
         if path.exists() {
-            let text = std::fs::read_to_string(&path)
+            let text = std::fs::read_to_string(path)
                 .with_context(|| format!("reading {}", path.display()))?;
             let cfg: Config =
                 toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
             Ok(cfg)
         } else {
             let cfg = Config::default();
-            cfg.save()?;
+            cfg.save_to(path)?;
             Ok(cfg)
         }
     }
 
-    /// Persist current config back to disk.
-    pub fn save(&self) -> Result<()> {
-        let path = config_path()?;
+    /// Persist to a specific path — the testable core of [`Config::save`].
+    pub fn save_to(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let text = toml::to_string_pretty(self).context("serializing config")?;
-        std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+        std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
         Ok(())
     }
 }
@@ -130,4 +139,106 @@ pub fn token_path() -> Result<PathBuf> {
 fn project_dirs() -> Result<ProjectDirs> {
     ProjectDirs::from("com", "calendar-notification", "calendar-notification")
         .context("could not determine XDG project directories")
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::field_reassign_with_default)]
+    use super::*;
+
+    #[test]
+    fn default_has_no_credentials() {
+        let cfg = Config::default();
+        assert!(!cfg.has_credentials());
+        assert_eq!(cfg.poll_interval_minutes, 5);
+        assert!(cfg.calendars.is_empty());
+    }
+
+    #[test]
+    fn has_credentials_requires_both_nonblank() {
+        let mut cfg = Config::default();
+        cfg.client_id = "id".into();
+        assert!(!cfg.has_credentials(), "secret still missing");
+        cfg.client_secret = "  ".into();
+        assert!(!cfg.has_credentials(), "blank secret does not count");
+        cfg.client_secret = "secret".into();
+        assert!(cfg.has_credentials());
+    }
+
+    #[test]
+    fn ensure_calendar_inserts_once_and_preserves_prefs() {
+        let mut cfg = Config::default();
+        cfg.ensure_calendar("cal-1", "#ff0000");
+        cfg.calendars.get_mut("cal-1").unwrap().visible = false;
+        // Re-ensuring must not clobber the user's changed pref.
+        cfg.ensure_calendar("cal-1", "#00ff00");
+        let prefs = &cfg.calendars["cal-1"];
+        assert!(!prefs.visible);
+        assert_eq!(prefs.color, "#ff0000");
+        assert_eq!(cfg.calendars.len(), 1);
+    }
+
+    #[test]
+    fn partial_toml_fills_defaults() {
+        // Only credentials present; everything else should default.
+        let toml = r#"client_id = "abc"
+client_secret = "xyz""#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.has_credentials());
+        assert_eq!(cfg.poll_interval_minutes, 5);
+        assert!(cfg.calendars.is_empty());
+    }
+
+    #[test]
+    fn calendar_prefs_default_true() {
+        let toml = r##"[calendars."c1"]
+color = "#123456""##;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let p = &cfg.calendars["c1"];
+        assert!(p.visible);
+        assert!(p.notify);
+        assert_eq!(p.color, "#123456");
+    }
+
+    #[test]
+    fn load_or_create_creates_then_reads_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/config.toml");
+
+        // First run: file doesn't exist -> defaults written.
+        let created = Config::load_or_create_at(&path).unwrap();
+        assert!(path.exists(), "default file should be created");
+        assert!(!created.has_credentials());
+
+        // Mutate + save, then reload and confirm it round-trips.
+        let mut cfg = created;
+        cfg.client_id = "id".into();
+        cfg.client_secret = "sec".into();
+        cfg.poll_interval_minutes = 15;
+        cfg.ensure_calendar("cal", "#abcdef");
+        cfg.save_to(&path).unwrap();
+
+        let reloaded = Config::load_or_create_at(&path).unwrap();
+        assert_eq!(reloaded.client_id, "id");
+        assert_eq!(reloaded.poll_interval_minutes, 15);
+        assert_eq!(reloaded.calendars["cal"].color, "#abcdef");
+    }
+
+    #[test]
+    fn load_or_create_rejects_malformed_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "this is = not valid = toml =").unwrap();
+        assert!(Config::load_or_create_at(&path).is_err());
+    }
+
+    #[test]
+    fn xdg_paths_end_with_expected_names() {
+        assert!(config_path()
+            .unwrap()
+            .ends_with("calendar-notification/config.toml"));
+        assert!(token_path()
+            .unwrap()
+            .ends_with("calendar-notification/token.json"));
+    }
 }

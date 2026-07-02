@@ -46,7 +46,8 @@ iced daemon (main thread) ◀── Subscription bridge (static UI_RX) ──
 
 | File | Responsibility |
 |---|---|
-| `main.rs` | Panic hook, rustls provider, config load, channel + thread setup, launches daemon |
+| `lib.rs` | `run()`: panic hook, rustls provider, config load, channel + thread setup, launches daemon. Exposes all modules so tests can reach them |
+| `main.rs` | Thin wrapper: `fn main() { calendar_notification::run() }` |
 | `config.rs` | TOML config at `~/.config/calendar-notification/config.toml`; XDG paths |
 | `engine.rs` | `UiEvent`/`Command`/`CalendarView` types; sync + scheduler + command hub loop |
 | `notify.rs` | `notify-rust` reminder wrapper (async) |
@@ -107,14 +108,53 @@ iced daemon (main thread) ◀── Subscription bridge (static UI_RX) ──
 
 ```bash
 cargo build            # or --release
-cargo test             # recurrence + client encoding + parse_hex tests
-cargo clippy           # keep at zero warnings
+cargo test             # unit (in-module) + integration (tests/integration.rs)
+cargo clippy --tests   # keep at zero warnings (tests included)
 cargo fmt              # run before finishing
 ./target/release/calendar-notification
 ```
 
 Config: `~/.config/calendar-notification/config.toml`. OAuth token cache:
 `~/.local/share/calendar-notification/token.json`.
+
+## Testing & coverage
+
+**Policy (important — hold yourself to this):** this project has a **≥80% line
+coverage goal**, and it is currently met (~84%). Always strive to keep it there
+or higher. **Any code you add should come with tests** — treat a change as
+incomplete until its new logic is exercised. Before finishing a change:
+run `cargo llvm-cov --summary-only`, and if your edit dropped coverage or added
+untested logic, add tests until you're back at/above the goal. If something is
+genuinely not unit-testable (needs live GUI/network/D-Bus/OAuth — see the
+"Intentionally uncovered" list below), say so explicitly rather than skipping
+silently; don't pad coverage with brittle mocks of those layers.
+
+- **Unit tests** live in each module under `#[cfg(test)] mod tests` (they can
+  reach private fns — that's where most coverage comes from). **Integration
+  tests** in `tests/integration.rs` exercise the public API as an external
+  consumer.
+- **Coverage** (~84% line, run it before/after test changes):
+  ```bash
+  cargo llvm-cov --summary-only       # table
+  cargo llvm-cov --open               # HTML report
+  ```
+- **Testability patterns already in place — reuse them:**
+  - The engine is generic over the `CalendarSource` trait (`engine.rs`); tests
+    inject a `FakeSource` to drive `resync`/`handle_command`/`run_loop` without
+    network. `run()` builds the real `GoogleClient` (which impls the trait).
+  - `Engine.config_path` is injectable so tests persist config to a `tempfile`
+    tempdir instead of the real `~/.config`. Never let a test write there.
+  - `Config::load_or_create_at` / `save_to` take an explicit path for the same
+    reason — prefer them in tests over the XDG-resolving `load_or_create`/`save`.
+  - iced `view()`/`update()` are plain functions — call them directly in tests
+    (building the widget tree needs no GPU/event loop). Assert `update` side
+    effects by draining the `Command`/`UiEvent` channels.
+  - The tray's `menu()` and its `activate` closures are testable by building a
+    `CalTray`, calling `menu()`, and invoking the boxed closures.
+- **Intentionally uncovered** (needs live GUI / network / D-Bus / OAuth, not
+  unit-testable): `lib.rs::run`, `google/auth.rs`, the `GoogleClient` network
+  method bodies, `notify::show_reminder`, `main.rs`. Don't chase these with
+  brittle mocks — verify them by running the app.
 
 ## Verifying changes
 

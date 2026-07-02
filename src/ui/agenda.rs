@@ -135,7 +135,12 @@ fn parse_hex(hex: &str) -> Color {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_hex;
+    use super::*;
+    use crate::app::App;
+    use crate::engine::CalendarView;
+    use crate::google::model::Occurrence;
+    use chrono::{Duration, Local};
+    use tokio::sync::mpsc::unbounded_channel;
 
     #[test]
     fn non_ascii_six_byte_color_does_not_panic() {
@@ -151,7 +156,74 @@ mod tests {
         let c = parse_hex("#4285F4");
         assert_eq!(
             (c.r, c.g, c.b),
-            (0x42 as f32 / 255.0, 0x85 as f32 / 255.0, 0xF4 as f32 / 255.0)
+            (
+                0x42 as f32 / 255.0,
+                0x85 as f32 / 255.0,
+                0xF4 as f32 / 255.0
+            )
         );
+    }
+
+    #[test]
+    fn parse_hex_short_or_invalid_is_gray() {
+        for bad in ["", "#12", "gggggg", "#12345"] {
+            let c = parse_hex(bad);
+            assert!((c.r - 0.5).abs() < f32::EPSILON);
+        }
+    }
+
+    fn cal(id: &str, color: &str, visible: bool) -> CalendarView {
+        CalendarView {
+            id: id.into(),
+            summary: id.into(),
+            color: color.into(),
+            primary: false,
+            visible,
+            notify: true,
+        }
+    }
+
+    fn occ(cal_id: &str, all_day: bool, loc: Option<&str>, offset_h: i64) -> Occurrence {
+        let start = Local::now() + Duration::hours(offset_h);
+        Occurrence {
+            event_id: "e".into(),
+            calendar_id: cal_id.into(),
+            title: "Event".into(),
+            location: loc.map(|s| s.into()),
+            start,
+            end: start + Duration::hours(1),
+            all_day,
+            reminders: vec![],
+        }
+    }
+
+    fn app_with(cals: Vec<CalendarView>, occs: Vec<Occurrence>) -> App {
+        let (tx, _rx) = unbounded_channel();
+        let mut app = App::new(tx);
+        app.calendars = cals;
+        app.occurrences = occs;
+        app
+    }
+
+    #[test]
+    fn view_renders_todays_events() {
+        // A timed event with location, an all-day event, and an event on a
+        // hidden calendar (filtered out) + one on another day (filtered out).
+        let app = app_with(
+            vec![cal("p", "#4285F4", true), cal("h", "", false)],
+            vec![
+                occ("p", false, Some("Room 1"), 0),
+                occ("p", true, None, 1),
+                occ("h", false, None, 0),  // hidden calendar
+                occ("p", false, None, 48), // not today
+            ],
+        );
+        let _ = view(&app);
+    }
+
+    #[test]
+    fn view_empty_state() {
+        let app = app_with(vec![cal("p", "#4285F4", true)], vec![]);
+        let _ = view(&app);
     }
 }
