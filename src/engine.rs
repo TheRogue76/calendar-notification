@@ -21,6 +21,14 @@ use crate::notify;
 use crate::tray::CalTray;
 
 /// Reminders window: how far ahead we fetch occurrences for scheduling.
+///
+/// Known limitation: a reminder only fires if its *fire time*
+/// (`event start − lead`) falls inside this window. A long lead on a distant
+/// event (e.g. a "1 week before" reminder on an event 10 days out) is missed —
+/// while the event is beyond the window it isn't fetched, and once it enters
+/// the window the fire time is already in the past and gets skipped as stale.
+/// Common minute/hour/1-day leads are unaffected. Widen this (at the cost of a
+/// larger per-sync fetch) if longer leads need to be honoured.
 const REMINDER_WINDOW_HOURS: i64 = 48;
 
 /// The calendar data source the engine talks to. Implemented by the real
@@ -80,6 +88,19 @@ pub enum Command {
     ToggleWidget,
     /// Shut everything down.
     Quit,
+}
+
+/// The next reminder due to fire, as chosen by [`Engine::next_reminder`].
+#[derive(Debug, Clone)]
+struct ScheduledReminder {
+    /// When the reminder should fire (UTC).
+    fire: DateTime<Utc>,
+    /// Index into [`Engine::occurrences`] of the occurrence it belongs to.
+    idx: usize,
+    /// Lead time in minutes (for phrasing the notification).
+    minutes: i64,
+    /// Dedup key (`occurrence_key::minutes`) recorded once fired.
+    key: String,
 }
 
 struct Engine<C: CalendarSource> {
@@ -151,10 +172,15 @@ impl<C: CalendarSource> Engine<C> {
 
         match self.client.list_calendars().await {
             Ok(cals) => {
+                // Only touch disk when a genuinely new calendar appeared;
+                // resync runs every poll and shouldn't rewrite config each time.
+                let mut changed = false;
                 for c in &cals {
-                    self.config.ensure_calendar(&c.id, &c.color);
+                    changed |= self.config.ensure_calendar(&c.id, &c.color);
                 }
-                self.save_config();
+                if changed {
+                    self.save_config();
+                }
                 self.calendars = cals;
             }
             Err(e) => {
@@ -174,17 +200,28 @@ impl<C: CalendarSource> Engine<C> {
             .unwrap_or(now);
         let time_max = now + Duration::hours(REMINDER_WINDOW_HOURS);
 
-        let mut all = Vec::new();
-        for c in &self.calendars {
+        // Fetch every relevant calendar concurrently rather than serializing a
+        // network round-trip per calendar (holiday/shared calendars add up).
+        let client = &self.client;
+        let fetches = self.calendars.iter().filter_map(|c| {
             let prefs = self.config.calendars.get(&c.id);
             let visible = prefs.map(|p| p.visible).unwrap_or(true);
             let notify = prefs.map(|p| p.notify).unwrap_or(true);
             if !visible && !notify {
-                continue; // no reason to fetch this calendar
+                return None; // no reason to fetch this calendar
             }
-            match self.client.list_events(&c.id, today_start, time_max).await {
+            Some(async move {
+                let res = client.list_events(&c.id, today_start, time_max).await;
+                (c.id.as_str(), res)
+            })
+        });
+        let results = futures::future::join_all(fetches).await;
+
+        let mut all = Vec::new();
+        for (id, res) in results {
+            match res {
                 Ok(mut occs) => all.append(&mut occs),
-                Err(e) => warn!("events fetch failed for {}: {e:#}", c.id),
+                Err(e) => warn!("events fetch failed for {id}: {e:#}"),
             }
         }
 
@@ -206,8 +243,13 @@ impl<C: CalendarSource> Engine<C> {
             .iter()
             .map(|o| o.occurrence_key())
             .collect();
-        self.fired
-            .retain(|k| live.iter().any(|live_key| k.starts_with(live_key)));
+        // A fired key is `{occurrence_key}::{minutes}`; strip the trailing
+        // `::minutes` (the last separator) to recover the occurrence key and
+        // test it against the live set directly — an O(1) lookup per key.
+        self.fired.retain(|k| {
+            k.rsplit_once("::")
+                .is_some_and(|(occ_key, _minutes)| live.contains(occ_key))
+        });
     }
 
     /// Which calendars currently have notifications enabled.
@@ -227,11 +269,11 @@ impl<C: CalendarSource> Engine<C> {
     }
 
     /// Find the earliest not-yet-fired reminder across all notify-enabled
-    /// calendars. Returns (fire_time, occurrence index, minutes, dedup key).
-    fn next_reminder(&self) -> Option<(DateTime<Utc>, usize, i64, String)> {
+    /// calendars.
+    fn next_reminder(&self) -> Option<ScheduledReminder> {
         let notify = self.notify_enabled();
         let now = Utc::now();
-        let mut best: Option<(DateTime<Utc>, usize, i64, String)> = None;
+        let mut best: Option<ScheduledReminder> = None;
 
         for (idx, occ) in self.occurrences.iter().enumerate() {
             if !notify.get(&occ.calendar_id).copied().unwrap_or(true) {
@@ -247,8 +289,13 @@ impl<C: CalendarSource> Engine<C> {
                 if fire < now - Duration::minutes(5) {
                     continue;
                 }
-                if best.as_ref().map(|(bf, ..)| fire < *bf).unwrap_or(true) {
-                    best = Some((fire, idx, minutes, key));
+                if best.as_ref().map(|b| fire < b.fire).unwrap_or(true) {
+                    best = Some(ScheduledReminder {
+                        fire,
+                        idx,
+                        minutes,
+                        key,
+                    });
                 }
             }
         }
@@ -358,7 +405,7 @@ async fn run_loop<C: CalendarSource>(
         // A single future for the reminder arm: it sleeps until the next fire
         // time, or — when nothing is scheduled — never resolves, so the arm
         // simply stays dormant. This avoids any unwrap/precondition coupling.
-        let fire_at = next.as_ref().map(|(fire, ..)| deadline_for(*fire));
+        let fire_at = next.as_ref().map(|r| deadline_for(r.fire));
         let reminder_ready = async move {
             match fire_at {
                 Some(at) => tokio::time::sleep_until(at).await,
@@ -381,8 +428,8 @@ async fn run_loop<C: CalendarSource>(
                 engine.resync().await;
             }
             _ = reminder_ready => {
-                if let Some((_, idx, minutes, key)) = next {
-                    engine.fire_reminder(idx, minutes, key).await;
+                if let Some(r) = next {
+                    engine.fire_reminder(r.idx, r.minutes, r.key).await;
                 }
             }
         }
@@ -535,14 +582,13 @@ mod tests {
             // sooner: future in 30 min (start +40, lead 10)
             occ("p", now + Duration::minutes(40), vec![10]),
         ];
-        let (_, idx, minutes, key) = e.next_reminder().expect("a reminder");
-        assert_eq!(minutes, 10, "closest reminder wins");
-        assert_eq!(idx, 2);
+        let r = e.next_reminder().expect("a reminder");
+        assert_eq!(r.minutes, 10, "closest reminder wins");
+        assert_eq!(r.idx, 2);
 
         // Once that key is fired, the next call returns the later one.
-        e.fired.insert(key);
-        let (_, _, minutes2, _) = e.next_reminder().unwrap();
-        assert_eq!(minutes2, 60);
+        e.fired.insert(r.key);
+        assert_eq!(e.next_reminder().unwrap().minutes, 60);
     }
 
     #[test]

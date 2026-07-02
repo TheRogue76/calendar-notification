@@ -174,13 +174,19 @@ fn to_occurrence(
     let (start_dt, all_day) = parse_start(ev.start.as_ref())?;
     let end_dt = parse_end(ev.end.as_ref()).unwrap_or(start_dt);
 
-    // Effective reminders: event overrides win; otherwise fall back to the
-    // calendar's defaults (matching Google's useDefault semantics).
+    // Effective reminders, matching Google's useDefault semantics:
+    //   useDefault=false + overrides -> those overrides win;
+    //   useDefault=false + no overrides -> the event has *no* reminders;
+    //   anything else (useDefault=true / unset) -> the calendar's defaults.
     let reminders = match &ev.reminders {
         Some(EventReminders {
             use_default: Some(false),
             overrides: Some(ov),
         }) => reminder_rules(Some(ov.as_slice())),
+        Some(EventReminders {
+            use_default: Some(false),
+            overrides: None,
+        }) => Vec::new(),
         _ => calendar_defaults.to_vec(),
     };
 
@@ -435,6 +441,19 @@ mod tests {
         });
         let occ = to_occurrence("cal", ev, &[ReminderRule { minutes: 15 }]).unwrap();
         assert_eq!(occ.reminders, vec![ReminderRule { minutes: 2 }]);
+    }
+
+    #[test]
+    fn to_occurrence_use_default_false_without_overrides_has_no_reminders() {
+        let mut ev = timed_event(Some("e1"));
+        // useDefault=false with no overrides means the event opted out of
+        // reminders entirely — calendar defaults must NOT be applied.
+        ev.reminders = Some(EventReminders {
+            use_default: Some(false),
+            overrides: None,
+        });
+        let occ = to_occurrence("cal", ev, &[ReminderRule { minutes: 15 }]).unwrap();
+        assert!(occ.reminders.is_empty());
     }
 
     #[test]

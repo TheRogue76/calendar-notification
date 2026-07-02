@@ -23,7 +23,7 @@ pub struct ReminderRule {
 
 /// A single concrete occurrence of an event (recurring events are expanded into
 /// one `Occurrence` per instance within the working window).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Occurrence {
     /// Google event id (shared across occurrences of a recurring series).
     pub event_id: String,
@@ -102,7 +102,7 @@ mod tests {
 }
 
 /// A new event to create, assembled by the add-event form.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewEvent {
     pub calendar_id: String,
     pub title: String,
