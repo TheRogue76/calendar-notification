@@ -315,21 +315,17 @@ fn event_times(new: &NewEvent) -> (EventDateTime, EventDateTime) {
     }
 }
 
-/// Attendee list for the API, or `None` when there are no guests.
-fn event_attendees(new: &NewEvent) -> Option<Vec<EventAttendee>> {
-    if new.attendees.is_empty() {
-        None
-    } else {
-        Some(
-            new.attendees
-                .iter()
-                .map(|email| EventAttendee {
-                    email: Some(email.clone()),
-                    ..Default::default()
-                })
-                .collect(),
-        )
-    }
+/// Attendee list for the API. Callers decide how to represent "no guests":
+/// insert omits the field (`None`), patch must send `Some(vec![])` so an
+/// emptied guest list actually clears the attendees.
+fn event_attendees(new: &NewEvent) -> Vec<EventAttendee> {
+    new.attendees
+        .iter()
+        .map(|email| EventAttendee {
+            email: Some(email.clone()),
+            ..Default::default()
+        })
+        .collect()
 }
 
 fn build_event(new: &NewEvent) -> Event {
@@ -341,24 +337,26 @@ fn build_event(new: &NewEvent) -> Event {
         Some(new.recurrence.clone())
     };
 
+    let attendees = event_attendees(new);
     Event {
         summary: Some(new.title.clone()),
         location: new.location.clone(),
         description: new.description.clone(),
         start: Some(start),
         end: Some(end),
-        attendees: event_attendees(new),
+        attendees: (!attendees.is_empty()).then_some(attendees),
         recurrence,
         // Leave reminders on useDefault so the calendar's defaults apply.
         ..Default::default()
     }
 }
 
-/// Build the `Event` for a PATCH update. Two differences from [`build_event`]:
-/// blank `location`/`description` are sent as `Some("")` so they can be cleared
-/// (PATCH ignores fields left as `None`), and `recurrence`/`reminders` are
-/// omitted entirely so the existing series RRULE and reminder overrides are
-/// preserved (the edit form doesn't expose them).
+/// Build the `Event` for a PATCH update. Differences from [`build_event`]:
+/// blank `location`/`description` are sent as `Some("")` and an empty guest
+/// list as `Some(vec![])` so they can be cleared (PATCH ignores fields left as
+/// `None`), while `recurrence`/`reminders` are omitted entirely so the existing
+/// series RRULE and reminder overrides are preserved (the edit form doesn't
+/// expose them).
 fn build_patch(new: &NewEvent) -> Event {
     let (start, end) = event_times(new);
     Event {
@@ -367,7 +365,7 @@ fn build_patch(new: &NewEvent) -> Event {
         description: Some(new.description.clone().unwrap_or_default()),
         start: Some(start),
         end: Some(end),
-        attendees: event_attendees(new),
+        attendees: Some(event_attendees(new)),
         ..Default::default()
     }
 }
@@ -652,6 +650,21 @@ mod tests {
         // Some("") lets PATCH clear the field; None would leave it unchanged.
         assert_eq!(ev.location.as_deref(), Some(""));
         assert_eq!(ev.description.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn build_patch_sends_empty_attendees_to_clear_guests() {
+        let mut n = base_new();
+        n.attendees = vec![];
+        let ev = build_patch(&n);
+        // Some(vec![]) lets PATCH remove all guests; None would leave them.
+        let att = ev.attendees.expect("attendees must be present in a patch");
+        assert!(att.is_empty(), "an emptied guest list clears attendees");
+
+        // With guests present they are mapped as usual.
+        n.attendees = vec!["a@x.com".into()];
+        let ev = build_patch(&n);
+        assert_eq!(ev.attendees.unwrap()[0].email.as_deref(), Some("a@x.com"));
     }
 
     #[test]

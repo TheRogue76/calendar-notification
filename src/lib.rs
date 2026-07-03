@@ -97,8 +97,11 @@ pub fn run() -> iced::Result {
             {
                 Ok(rt) => rt,
                 Err(e) => {
+                    // Exit rather than return: a bare return would leave the
+                    // windowless iced daemon running with no tray and no engine
+                    // — an invisible zombie. Exiting lets systemd restart us.
                     error!("failed to start background runtime: {e:#}");
-                    return;
+                    std::process::exit(1);
                 }
             };
             rt.block_on(async move {
@@ -109,9 +112,11 @@ pub fn run() -> iced::Result {
                 let auth = match build_authenticator(&cfg).await {
                     Ok(a) => a,
                     Err(e) => {
+                        // Same fail-fast rationale as the panic hook: without an
+                        // engine the daemon is an invisible zombie (no tray, no
+                        // window), so exit and let systemd restart us.
                         error!("OAuth failed: {e:#}");
-                        let _ = ui_tx.send(UiEvent::Status("Auth failed — see logs".into()));
-                        return;
+                        std::process::exit(1);
                     }
                 };
                 let client = GoogleClient::new(auth);

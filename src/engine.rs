@@ -65,7 +65,12 @@ pub enum UiEvent {
     /// Result of an add-event request: Ok(event_id) or Err(message).
     EventCreated(std::result::Result<String, String>),
     /// Full details of a selected event: Ok(details) or Err(message).
-    EventLoaded(std::result::Result<EventDetails, String>),
+    /// Carries the requested `event_id` so the UI can drop a slow response
+    /// that arrives after the user selected a different event.
+    EventLoaded {
+        event_id: String,
+        result: std::result::Result<EventDetails, String>,
+    },
     /// Result of an edit request: Ok(event_id) or Err(message).
     EventUpdated(std::result::Result<String, String>),
     /// Result of a delete request: Ok(()) or Err(message).
@@ -249,10 +254,23 @@ impl<C: CalendarSource> Engine<C> {
         let results = futures::future::join_all(fetches).await;
 
         let mut all = Vec::new();
+        let mut failed = 0usize;
         for (id, res) in results {
             match res {
                 Ok(mut occs) => all.append(&mut occs),
-                Err(e) => warn!("events fetch failed for {id}: {e:#}"),
+                Err(e) => {
+                    // Keep this calendar's previous window: dropping it would
+                    // wipe its agenda entries, scheduled reminders, and fired
+                    // dedup keys over a transient per-calendar failure.
+                    warn!("events fetch failed for {id}: {e:#}");
+                    failed += 1;
+                    all.extend(
+                        self.occurrences
+                            .iter()
+                            .filter(|o| o.calendar_id == id)
+                            .cloned(),
+                    );
+                }
             }
         }
 
@@ -261,11 +279,17 @@ impl<C: CalendarSource> Engine<C> {
         self.prune_fired();
         self.emit(UiEvent::Occurrences(self.occurrences.clone()));
         self.publish_next_event().await;
-        self.emit(UiEvent::Status(format!(
-            "Synced {}",
-            Local::now().format("%H:%M")
-        )));
-        info!("resync complete: {} occurrences", self.occurrences.len());
+        let stamp = Local::now().format("%H:%M");
+        let status = if failed == 0 {
+            format!("Synced {stamp}")
+        } else {
+            format!("Synced {stamp} — {failed} calendar(s) failed")
+        };
+        self.emit(UiEvent::Status(status));
+        info!(
+            "resync complete: {} occurrences ({failed} calendars failed)",
+            self.occurrences.len()
+        );
     }
 
     /// Drop dedup entries for occurrences that are no longer in the window.
@@ -424,7 +448,7 @@ impl<C: CalendarSource> Engine<C> {
                     .get_event(&calendar_id, &event_id)
                     .await
                     .map_err(|e| format!("{e:#}"));
-                self.emit(UiEvent::EventLoaded(result));
+                self.emit(UiEvent::EventLoaded { event_id, result });
             }
             Command::UpdateEvent {
                 calendar_id,
@@ -579,6 +603,8 @@ mod tests {
         updated: Mutex<Vec<(String, String, NewEvent)>>,
         deleted: Mutex<Vec<(String, String)>>,
         fail_calendars: bool,
+        /// Calendar ids whose `list_events` call fails (per-calendar outage).
+        fail_events: HashSet<String>,
     }
 
     impl FakeSource {
@@ -590,6 +616,7 @@ mod tests {
                 updated: Mutex::new(Vec::new()),
                 deleted: Mutex::new(Vec::new()),
                 fail_calendars: false,
+                fail_events: HashSet::new(),
             }
         }
     }
@@ -607,6 +634,9 @@ mod tests {
             _min: DateTime<Utc>,
             _max: DateTime<Utc>,
         ) -> Result<Vec<Occurrence>> {
+            if self.fail_events.contains(calendar_id) {
+                anyhow::bail!("events unavailable");
+            }
             Ok(self.events.get(calendar_id).cloned().unwrap_or_default())
         }
         async fn insert_event(&self, new: &NewEvent) -> Result<String> {
@@ -846,6 +876,38 @@ mod tests {
             .any(|ev| matches!(ev, UiEvent::Status(s) if s.contains("Offline"))));
     }
 
+    #[tokio::test]
+    async fn resync_partial_failure_keeps_previous_window_and_flags_status() {
+        let mut fake = FakeSource::new(vec![cal("a", true), cal("b", false)]);
+        let occ_a = occ("a", Local::now() + Duration::hours(1), vec![10]);
+        let occ_b = occ("b", Local::now() + Duration::hours(2), vec![10]);
+        fake.events.insert("a".into(), vec![occ_a]);
+        fake.events.insert("b".into(), vec![occ_b.clone()]);
+        let (mut e, mut rx, _d) = engine_with(fake, Config::default());
+
+        // Healthy sync: both calendars present; mark b's reminder as fired.
+        e.resync().await;
+        assert_eq!(e.occurrences.len(), 2);
+        let fired_b = format!("{}::10", occ_b.occurrence_key());
+        e.fired.insert(fired_b.clone());
+        drain(&mut rx);
+
+        // b's events fetch now fails: its previous occurrences (and the fired
+        // dedup key) must survive, and the status must say the sync was partial.
+        e.client.fail_events.insert("b".into());
+        e.resync().await;
+        assert_eq!(e.occurrences.len(), 2, "b's window is retained");
+        assert!(e
+            .occurrences
+            .iter()
+            .any(|o| o.calendar_id == "b" && o.start == occ_b.start));
+        assert!(e.fired.contains(&fired_b), "dedup key not pruned");
+        let evs = drain(&mut rx);
+        assert!(evs
+            .iter()
+            .any(|ev| matches!(ev, UiEvent::Status(s) if s.contains("1 calendar(s) failed"))));
+    }
+
     // -- handle_command ------------------------------------------------------
 
     #[tokio::test]
@@ -908,7 +970,8 @@ mod tests {
         let evs = drain(&mut rx);
         assert!(evs.iter().any(|ev| matches!(
             ev,
-            UiEvent::EventLoaded(Ok(d)) if d.event_id == "evt" && d.calendar_id == "p"
+            UiEvent::EventLoaded { event_id, result: Ok(d) }
+                if event_id == "evt" && d.event_id == "evt" && d.calendar_id == "p"
         )));
     }
 
