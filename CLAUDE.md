@@ -59,9 +59,10 @@ iced daemon (main thread) ◀── Subscription bridge (static UI_RX) ──
 | `notify.rs` | `notify-rust` reminder wrapper (async) |
 | `icon.rs` | Draws the colored-calendar glyph as RGBA; shared by the tray (repacked to ARGB) and the widget window icon |
 | `tray.rs` | `ksni` tray: menu, per-calendar submenu, sends `Command`s |
-| `app.rs` | iced daemon: `App` state, `Message`, update/view/subscription, window toggle |
+| `app.rs` | iced daemon: `App` state, `Message`, update/view/subscription, window toggle, `UiExecutor` |
 | `ui/agenda.rs` | Today's agenda list + calendar filter chips |
 | `ui/add_event.rs` | Add-event form state, view, and `NewEvent` assembly |
+| `ui/detail.rs` | Event detail pane: full event view, edit entry point, delete confirm |
 | `ui/recurrence.rs` | Recurrence presets ↔ RRULE strings (unit-tested) |
 | `google/auth.rs` | `yup-oauth2` InstalledFlow authenticator |
 | `google/client.rs` | `CalendarHub` wrapper: list calendars/events, insert; domain conversion |
@@ -69,7 +70,7 @@ iced daemon (main thread) ◀── Subscription bridge (static UI_RX) ──
 
 ## Hard-won gotchas (don't regress these)
 
-- **rustls needs exactly one crypto provider.** `main.rs` calls
+- **rustls needs exactly one crypto provider.** `lib.rs::run()` calls
   `rustls::crypto::ring::default_provider().install_default()`. `hyper-rustls`
   is pinned with `default-features = false` so it can't drag in `aws-lc-rs`
   alongside `ring` (two providers → panic on first TLS). Keep it to `ring` only.
@@ -116,11 +117,36 @@ iced daemon (main thread) ◀── Subscription bridge (static UI_RX) ──
   (the "exit on last window" path is gated by `!is_daemon`). `close_events()`
   clears `App::widget` so the tray can reopen it.
 
-- **Fail-fast panic policy.** A panic hook in `main.rs` logs then
+- **Fail-fast panic policy.** A panic hook in `lib.rs::run()` logs then
   `process::exit(101)` so any panic on any thread takes the whole process down
   (systemd `Restart=on-failure` restarts it) rather than leaving a zombie with a
   live tray but a dead engine. Prefer converting fallible operations to
-  `Result`/`Option`; don't `catch_unwind` for control flow.
+  `Result`/`Option`; don't `catch_unwind` for control flow. The same rule covers
+  non-panic startup failures: the engine thread `process::exit(1)`s if the
+  runtime or OAuth can't come up — a bare `return` would leave a windowless
+  iced daemon running invisibly with no tray and no engine.
+
+- **Both tokio runtimes are deliberately capped at 2 worker threads.** The
+  engine runtime (`lib.rs`, `.worker_threads(2)`) and the iced executor
+  (`app.rs::UiExecutor`, wired via `.executor::<UiExecutor>()` in `lib.rs`).
+  Default sizing spawns one worker per core *per runtime* — measured at 32 idle
+  threads / ~145 MB RSS on a 16-core machine for a workload of a few HTTP calls
+  per poll. Don't swap in `Runtime::new()` or drop the `.executor(...)` call.
+
+- **The widget renders with tiny-skia (software), not wgpu — on purpose.**
+  `Cargo.toml` builds iced with `default-features = false` to exclude the wgpu
+  GPU renderer: with wgpu, the first widget open mapped ~130 MB of Vulkan
+  driver + LLVM (lavapipe software-Vulkan) libraries into the process and
+  spiked RSS to ~220 MB. tiny-skia renders the same UI identically for ~24 MB
+  per open window. Don't re-enable iced's default features or add the `wgpu`
+  feature without re-measuring (`make perf` open/closed).
+
+- **Google list calls use partial-response `fields` masks.**
+  `client.rs::EVENT_LIST_FIELDS` / `CALENDAR_LIST_FIELDS` name exactly the JSON
+  fields the conversions read. If you make `to_occurrence`/`list_calendars` read
+  a new field, add it to the mask too — otherwise it arrives as `None` and fails
+  silently. A misspelled field is a live-API `400`, so verify any mask change by
+  running the app (unit tests can't catch it).
 
 ## Build / test / run
 
@@ -178,6 +204,32 @@ untested new code shows up as a red check + comment on the PR.
   unit-testable): `lib.rs::run`, `google/auth.rs`, the `GoogleClient` network
   method bodies, `notify::show_reminder`, `main.rs`. Don't chase these with
   brittle mocks — verify them by running the app.
+
+## Performance budget (check this on every change)
+
+The daemon must stay near-free while idle. **Before finishing any change**
+(alongside fmt/clippy/test/coverage), run:
+
+```bash
+make perf     # release binary size + running daemon CPU/RSS/threads
+```
+
+Baselines (2026-07, 16-core machine) — treat a significant regression like a
+failing test and investigate before finishing:
+
+- **CPU**: effectively zero while idle (~0.2 s CPU per 15 min uptime).
+- **Threads**: single digits. 30+ means a runtime lost its 2-worker cap (see
+  the gotcha above).
+- **Release binary**: ~16 MB (thin LTO + stripped symbols via
+  `[profile.release]`, no wgpu; it was 33 MB untuned).
+- **RSS**: ~21 MB idle before the widget is first opened; ~45 MB with the
+  widget open; settles ~43 MB after it closes (retained pages are shared,
+  clean font/library mappings — private/Anonymous stays under ~8 MB). Repeated
+  open/close must not ratchet. (All measured 2026-07-03 with tiny-skia; the
+  pre-tuning wgpu build idled at ~145 MB and spiked to ~220 MB on window open.)
+
+For allocation-level analysis use `make heaptrack` (stop the user service
+first so you don't register a second tray).
 
 ## Verifying changes
 

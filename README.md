@@ -141,6 +141,26 @@ service above, `Restart=on-failure` restarts it automatically, so fail-fast
 becomes self-healing. If you run it in a terminal instead, it will exit on a
 panic and you'll see the backtrace (set `RUST_BACKTRACE=1` for detail).
 
+## Performance
+
+The daemon is designed to be near-free while idle: both tokio runtimes (the
+engine's and the UI's) are capped at 2 worker threads each, release builds use
+thin LTO + stripped symbols, calendar syncs request Google *partial responses*
+(only the fields the app reads) to keep poll traffic small, and the widget
+renders with tiny-skia software rendering — a GPU stack (wgpu/Vulkan) costs
+~130 MB of mapped driver libraries for a small always-on tray app and buys
+nothing for this UI.
+
+To check the footprint at any time:
+
+```bash
+make perf         # release binary size + running daemon CPU/RSS/threads
+```
+
+For an allocation-level deep dive, install [heaptrack](https://github.com/KDE/heaptrack)
+(`sudo apt install heaptrack`), stop the user service so you don't get a second
+tray instance, and run `make heaptrack`.
+
 ## Configuration
 
 `~/.config/calendar-notification/config.toml`:

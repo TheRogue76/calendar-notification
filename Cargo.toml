@@ -6,8 +6,23 @@ description = "System-tray Google Calendar reminder daemon + on-screen agenda wi
 license = "MIT"
 
 [dependencies]
-# GUI (daemon mode: process lives in tray, opens widget window on demand)
-iced = { version = "0.14", features = ["tokio", "advanced"] }
+# GUI (daemon mode: process lives in tray, opens widget window on demand).
+# default-features=false drops the wgpu GPU renderer: opening the widget under
+# wgpu mapped ~130 MB of Vulkan driver + LLVM (lavapipe) libraries into the
+# process for a 380×520 window. tiny-skia software rendering was measured at
+# ~24 MB per open window, visually identical for this UI. Keep the remaining
+# default features (fonts/theme/platform) in sync with iced's defaults.
+iced = { version = "0.14", default-features = false, features = [
+    "tokio",
+    "advanced",
+    "tiny-skia",
+    "crisp",
+    "web-colors",
+    "thread-pool",
+    "linux-theme-detection",
+    "x11",
+    "wayland",
+] }
 
 # System tray (StatusNotifierItem) — pure zbus, no GTK/libdbus
 ksni = "0.3"
@@ -49,6 +64,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Bridge tokio streams into iced subscriptions
 futures = "0.3"
+
+[profile.release]
+# Size/perf tuning for the shipped daemon: symbols stripped (−8 MB measured),
+# thin LTO + single codegen unit for tighter code. Debug builds are untouched.
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
 
 [dev-dependencies]
 tempfile = "3"

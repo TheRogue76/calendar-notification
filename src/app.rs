@@ -26,6 +26,37 @@ pub fn install_ui_receiver(rx: UnboundedReceiver<UiEvent>) {
     let _ = UI_RX.set(Mutex::new(Some(rx)));
 }
 
+/// The iced daemon's executor: a 2-worker tokio runtime instead of iced's
+/// default one-worker-per-core `Runtime::new()`. The UI side only drives the
+/// subscription bridge and window tasks, so per-core workers are pure idle
+/// thread (and malloc-arena) overhead. Mirrors iced's own tokio backend impl.
+pub struct UiExecutor(tokio::runtime::Runtime);
+
+impl iced::Executor for UiExecutor {
+    fn new() -> Result<Self, iced::futures::io::Error> {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .map(Self)
+    }
+
+    fn spawn(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
+        // Detach: dropping the JoinHandle lets the spawned task run to
+        // completion on the runtime.
+        drop(self.0.spawn(future));
+    }
+
+    fn enter<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _guard = self.0.enter();
+        f()
+    }
+
+    fn block_on<T>(&self, future: impl std::future::Future<Output = T>) -> T {
+        self.0.block_on(future)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     Engine(UiEvent),
@@ -66,8 +97,11 @@ pub enum Message {
 /// selected (mirrors how the add-event form takes over).
 #[derive(Debug, Clone)]
 pub enum DetailState {
-    /// Details are being fetched; show the title we already have.
-    Loading { title: String },
+    /// Details are being fetched; show the title we already have. `event_id`
+    /// is the id we asked the engine for — only a matching [`UiEvent::EventLoaded`]
+    /// response may take over the pane (a slow response for a previously
+    /// selected event must not).
+    Loading { event_id: String, title: String },
     /// Fully-fetched event to display.
     Loaded(EventDetails),
     /// The fetch failed.
@@ -210,7 +244,8 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             title,
         } => {
             app.detail = Some(DetailState::Loading {
-                title: title.clone(),
+                event_id: event_id.clone(),
+                title,
             });
             app.selected_instance = Some(instance_id);
             app.delete_prompt = false;
@@ -286,19 +321,24 @@ fn handle_engine_event(app: &mut App, ev: UiEvent) -> Task<Message> {
             app.form.error = Some(e);
             Task::none()
         }
-        UiEvent::EventLoaded(Ok(details)) => {
-            // Ignore a stale load if the user already left the detail pane.
-            if app.detail.is_some() {
-                app.detail = Some(DetailState::Loaded(details));
-            }
-            Task::none()
-        }
-        UiEvent::EventLoaded(Err(message)) => {
-            if let Some(DetailState::Loading { title }) = &app.detail {
-                app.detail = Some(DetailState::Failed {
-                    title: title.clone(),
-                    message,
-                });
+        UiEvent::EventLoaded { event_id, result } => {
+            // Apply only while the pane is waiting for exactly this event;
+            // drop responses that are stale (pane closed, or the user selected
+            // a different event since the request went out).
+            if let Some(DetailState::Loading {
+                event_id: expected,
+                title,
+            }) = &app.detail
+            {
+                if *expected == event_id {
+                    app.detail = Some(match result {
+                        Ok(details) => DetailState::Loaded(details),
+                        Err(message) => DetailState::Failed {
+                            title: title.clone(),
+                            message,
+                        },
+                    });
+                }
             }
             Task::none()
         }
@@ -658,26 +698,58 @@ mod tests {
         assert!(!a.delete_prompt);
     }
 
+    fn loaded_ok(event_id: &str) -> UiEvent {
+        UiEvent::EventLoaded {
+            event_id: event_id.into(),
+            result: Ok(details()),
+        }
+    }
+
     #[test]
     fn event_loaded_transitions_loading_to_loaded_and_ignores_stale() {
         let (mut a, _rx) = app();
-        a.detail = Some(DetailState::Loading { title: "T".into() });
-        let _ = update(&mut a, Message::Engine(UiEvent::EventLoaded(Ok(details()))));
+        a.detail = Some(DetailState::Loading {
+            event_id: "master".into(),
+            title: "T".into(),
+        });
+        let _ = update(&mut a, Message::Engine(loaded_ok("master")));
         assert!(matches!(a.detail, Some(DetailState::Loaded(_))));
 
         // A load that arrives after the pane was closed is ignored.
         a.detail = None;
-        let _ = update(&mut a, Message::Engine(UiEvent::EventLoaded(Ok(details()))));
+        let _ = update(&mut a, Message::Engine(loaded_ok("master")));
         assert!(a.detail.is_none());
+    }
+
+    #[test]
+    fn event_loaded_for_a_different_event_is_ignored() {
+        let (mut a, _rx) = app();
+        // The user selected "other" after the request for "master" went out;
+        // the slow "master" response must not take over the pane.
+        a.detail = Some(DetailState::Loading {
+            event_id: "other".into(),
+            title: "Other".into(),
+        });
+        let _ = update(&mut a, Message::Engine(loaded_ok("master")));
+        assert!(
+            matches!(&a.detail, Some(DetailState::Loading { event_id, .. }) if event_id == "other"),
+            "stale response must leave the pane waiting for the newer event"
+        );
     }
 
     #[test]
     fn event_loaded_error_becomes_failed() {
         let (mut a, _rx) = app();
-        a.detail = Some(DetailState::Loading { title: "T".into() });
+        a.detail = Some(DetailState::Loading {
+            event_id: "master".into(),
+            title: "T".into(),
+        });
         let _ = update(
             &mut a,
-            Message::Engine(UiEvent::EventLoaded(Err("boom".into()))),
+            Message::Engine(UiEvent::EventLoaded {
+                event_id: "master".into(),
+                result: Err("boom".into()),
+            }),
         );
         assert!(matches!(a.detail, Some(DetailState::Failed { .. })));
     }
@@ -726,6 +798,22 @@ mod tests {
             "add form must not be in edit mode"
         );
         assert!(a.form.title.is_empty(), "prefilled title must be cleared");
+    }
+
+    #[test]
+    fn ui_executor_spawns_enters_and_blocks_on() {
+        use iced::Executor as _;
+        let ex = UiExecutor::new().expect("runtime builds");
+        let (tx, rx) = std::sync::mpsc::channel();
+        ex.spawn(async move {
+            let _ = tx.send(42);
+        });
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            42
+        );
+        assert_eq!(ex.block_on(async { 7 }), 7);
+        assert_eq!(ex.enter(|| 1), 1);
     }
 
     #[test]

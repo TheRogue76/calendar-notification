@@ -91,14 +91,21 @@ pub fn run() -> iced::Result {
     std::thread::Builder::new()
         .name("engine".into())
         .spawn(move || {
+            // 2 workers, not one per core: the whole workload is a handful of
+            // HTTP calls every poll plus the tray's D-Bus traffic. Default
+            // sizing spawned 16 idle workers here (and their malloc arenas).
             let rt = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_all()
                 .build()
             {
                 Ok(rt) => rt,
                 Err(e) => {
+                    // Exit rather than return: a bare return would leave the
+                    // windowless iced daemon running with no tray and no engine
+                    // — an invisible zombie. Exiting lets systemd restart us.
                     error!("failed to start background runtime: {e:#}");
-                    return;
+                    std::process::exit(1);
                 }
             };
             rt.block_on(async move {
@@ -109,9 +116,11 @@ pub fn run() -> iced::Result {
                 let auth = match build_authenticator(&cfg).await {
                     Ok(a) => a,
                     Err(e) => {
+                        // Same fail-fast rationale as the panic hook: without an
+                        // engine the daemon is an invisible zombie (no tray, no
+                        // window), so exit and let systemd restart us.
                         error!("OAuth failed: {e:#}");
-                        let _ = ui_tx.send(UiEvent::Status("Auth failed — see logs".into()));
-                        return;
+                        std::process::exit(1);
                     }
                 };
                 let client = GoogleClient::new(auth);
@@ -130,6 +139,10 @@ pub fn run() -> iced::Result {
         app::update,
         app::view,
     )
+    // Small custom executor: iced's default tokio executor also spawns one
+    // worker per core, which the UI (subscription bridge + window tasks)
+    // doesn't remotely need.
+    .executor::<app::UiExecutor>()
     .title(app::title)
     .subscription(app::subscription)
     .theme(app::theme)

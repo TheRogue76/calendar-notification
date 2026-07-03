@@ -18,7 +18,7 @@ pub fn view<'a>(
     selected_instance: Option<&'a str>,
 ) -> Element<'a, Message> {
     let title: &str = match detail {
-        DetailState::Loading { title } => title,
+        DetailState::Loading { title, .. } => title,
         DetailState::Loaded(d) => &d.title,
         DetailState::Failed { title, .. } => title,
     };
@@ -201,7 +201,10 @@ mod tests {
     #[test]
     fn view_builds_in_every_state() {
         let _ = view(
-            &DetailState::Loading { title: "T".into() },
+            &DetailState::Loading {
+                event_id: "evt".into(),
+                title: "T".into(),
+            },
             &cals(),
             false,
             None,
