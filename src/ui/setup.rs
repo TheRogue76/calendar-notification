@@ -108,7 +108,7 @@ fn form_view(state: &SetupState) -> Element<'_, Message> {
         content = content.push(text("Waiting for Google sign-in in your browser…").size(12));
     }
     if let Some(err) = &state.error {
-        content = content.push(text(err.clone()).size(13));
+        content = content.push(text(err.as_str()).size(13));
     }
 
     let mut save = button(if state.submitting {
