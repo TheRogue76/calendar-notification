@@ -41,9 +41,10 @@ impl iced::Executor for UiExecutor {
             .map(Self)
     }
 
-    #[allow(clippy::let_underscore_future)]
     fn spawn(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
-        let _ = self.0.spawn(future);
+        // Detach: dropping the JoinHandle lets the spawned task run to
+        // completion on the runtime.
+        drop(self.0.spawn(future));
     }
 
     fn enter<R>(&self, f: impl FnOnce() -> R) -> R {
