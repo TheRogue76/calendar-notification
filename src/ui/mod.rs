@@ -4,3 +4,4 @@ pub mod add_event;
 pub mod agenda;
 pub mod detail;
 pub mod recurrence;
+pub mod setup;

@@ -46,6 +46,20 @@ impl GoogleClient {
     }
 }
 
+/// Builds a live [`GoogleClient`] from the config's OAuth credentials. This is
+/// the production [`crate::engine::Authorizer`]; the engine holds one and calls
+/// it once the user has entered (or already saved) their credentials.
+pub struct GoogleAuthorizer;
+
+impl crate::engine::Authorizer for GoogleAuthorizer {
+    type Source = GoogleClient;
+
+    async fn authorize(&self, cfg: &crate::config::Config) -> Result<GoogleClient> {
+        let auth = crate::google::auth::build_authenticator(cfg).await?;
+        Ok(GoogleClient::new(auth))
+    }
+}
+
 impl crate::engine::CalendarSource for GoogleClient {
     /// All calendars the user can see.
     async fn list_calendars(&self) -> Result<Vec<Calendar>> {

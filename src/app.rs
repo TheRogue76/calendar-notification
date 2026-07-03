@@ -15,6 +15,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use crate::engine::{CalendarView, Command, UiEvent};
 use crate::google::model::{EventDetails, Occurrence};
 use crate::ui::add_event::{self, FormMsg, FormState};
+use crate::ui::setup::{self, SetupMsg, SetupState};
 use crate::ui::{agenda, detail};
 
 /// Engine → UI channel, installed by `main` before the daemon starts. The
@@ -91,6 +92,14 @@ pub enum Message {
         calendar_id: String,
         event_id: String,
     },
+    /// A field edit on the credential-setup screen.
+    Setup(SetupMsg),
+    /// Save the entered credentials (kicks off authorize + sync in the engine).
+    SubmitSetup,
+    /// Close the setup screen without saving.
+    CancelSetup,
+    /// Open Google Cloud Console in the user's browser (to create the OAuth client).
+    OpenSetupConsole,
 }
 
 /// State of the detail pane, which takes over the window when an event is
@@ -122,6 +131,9 @@ pub struct App {
     pub selected_instance: Option<String>,
     /// Whether the detail pane's inline delete confirmation is showing.
     pub delete_prompt: bool,
+    /// When `Some`, the credential-setup screen takes over the window (highest
+    /// priority — shown before form/detail/agenda).
+    pub setup: Option<SetupState>,
 }
 
 impl App {
@@ -136,6 +148,7 @@ impl App {
             detail: None,
             selected_instance: None,
             delete_prompt: false,
+            setup: None,
         }
     }
 
@@ -147,34 +160,44 @@ impl App {
         if let Some(id) = self.widget.take() {
             window::close(id)
         } else {
-            let settings = window::Settings {
-                size: Size::new(380.0, 520.0),
-                resizable: true,
-                decorations: true,
-                level: window::Level::AlwaysOnTop,
-                position: window::Position::Centered,
-                // The colored calendar glyph as the window/titlebar/taskbar icon.
-                // Honoured on X11; on GNOME/Wayland the dock icon comes from the
-                // `.desktop` file matched via `application_id` below instead.
-                icon: window_icon(),
-                platform_specific: window::settings::PlatformSpecific {
-                    // Must match the installed `calendar-notification.desktop`
-                    // basename / its `StartupWMClass` so GNOME shows our icon in
-                    // the dock rather than a generic fallback.
-                    application_id: "calendar-notification".to_string(),
-                    ..window::settings::PlatformSpecific::default()
-                },
-                // Let the titlebar ✕ close (hide) the widget window. In daemon
-                // mode this only closes the window — the process, tray, and
-                // reminders keep running — and `close_events()` clears
-                // `self.widget` so the tray toggle reopens it.
-                exit_on_close_request: true,
-                ..window::Settings::default()
-            };
-            let (id, open) = window::open(settings);
-            self.widget = Some(id);
-            open.discard()
+            self.open_widget()
         }
+    }
+
+    /// Open the widget window if it isn't already open (no-op otherwise). Used
+    /// by the tray toggle's open branch and by the setup screen, which must
+    /// force the window open regardless of its current state.
+    fn open_widget(&mut self) -> Task<Message> {
+        if self.widget.is_some() {
+            return Task::none();
+        }
+        let settings = window::Settings {
+            size: Size::new(380.0, 520.0),
+            resizable: true,
+            decorations: true,
+            level: window::Level::AlwaysOnTop,
+            position: window::Position::Centered,
+            // The colored calendar glyph as the window/titlebar/taskbar icon.
+            // Honoured on X11; on GNOME/Wayland the dock icon comes from the
+            // `.desktop` file matched via `application_id` below instead.
+            icon: window_icon(),
+            platform_specific: window::settings::PlatformSpecific {
+                // Must match the installed `calendar-notification.desktop`
+                // basename / its `StartupWMClass` so GNOME shows our icon in
+                // the dock rather than a generic fallback.
+                application_id: "calendar-notification".to_string(),
+                ..window::settings::PlatformSpecific::default()
+            },
+            // Let the titlebar ✕ close (hide) the widget window. In daemon
+            // mode this only closes the window — the process, tray, and
+            // reminders keep running — and `close_events()` clears
+            // `self.widget` so the tray toggle reopens it.
+            exit_on_close_request: true,
+            ..window::Settings::default()
+        };
+        let (id, open) = window::open(settings);
+        self.widget = Some(id);
+        open.discard()
     }
 }
 
@@ -287,6 +310,42 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             });
             Task::none()
         }
+        Message::Setup(m) => {
+            if let Some(setup) = &mut app.setup {
+                setup.update(m);
+            }
+            Task::none()
+        }
+        Message::SubmitSetup => {
+            let Some(setup) = &mut app.setup else {
+                return Task::none();
+            };
+            if setup.client_id.trim().is_empty() || setup.client_secret.trim().is_empty() {
+                setup.error = Some("Both Client ID and Client secret are required".into());
+                return Task::none();
+            }
+            setup.submitting = true;
+            setup.error = None;
+            let client_id = setup.client_id.trim().to_string();
+            let client_secret = setup.client_secret.trim().to_string();
+            app.send(Command::SaveCredentials {
+                client_id,
+                client_secret,
+            });
+            Task::none()
+        }
+        Message::CancelSetup => {
+            app.setup = None;
+            Task::none()
+        }
+        Message::OpenSetupConsole => {
+            // Best-effort: hand the console URL to the desktop's URL opener.
+            // Not unit-tested (spawns an external process); a failure is benign.
+            let _ = std::process::Command::new("xdg-open")
+                .arg(setup::CONSOLE_URL)
+                .spawn();
+            Task::none()
+        }
     }
 }
 
@@ -368,6 +427,27 @@ fn handle_engine_event(app: &mut App, ev: UiEvent) -> Task<Message> {
             app.status = e;
             Task::none()
         }
+        UiEvent::OpenSetup {
+            client_id,
+            client_secret,
+        } => {
+            app.setup = Some(SetupState::new(client_id, client_secret));
+            // Force the window open so the setup screen is actually visible even
+            // when triggered from the tray with no window showing.
+            app.open_widget()
+        }
+        UiEvent::SetupResult(Ok(())) => {
+            app.setup = None;
+            app.status = "Connected to Google".to_string();
+            Task::none()
+        }
+        UiEvent::SetupResult(Err(e)) => {
+            if let Some(setup) = &mut app.setup {
+                setup.submitting = false;
+                setup.error = Some(e);
+            }
+            Task::none()
+        }
         UiEvent::Status(s) => {
             app.status = s;
             Task::none()
@@ -377,7 +457,9 @@ fn handle_engine_event(app: &mut App, ev: UiEvent) -> Task<Message> {
 }
 
 pub fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
-    if app.form.open {
+    if let Some(setup) = &app.setup {
+        setup::view(setup)
+    } else if app.form.open {
         add_event::view(&app.form, &app.calendars)
     } else if let Some(detail) = &app.detail {
         detail::view(
@@ -857,6 +939,105 @@ mod tests {
         );
         assert!(!a.form.submitting);
         assert_eq!(a.form.error.as_deref(), Some("bad"));
+    }
+
+    #[test]
+    fn setup_field_edits_are_delegated() {
+        let (mut a, _rx) = app();
+        a.setup = Some(SetupState::default());
+        let _ = update(&mut a, Message::Setup(SetupMsg::ClientId("id".into())));
+        let _ = update(&mut a, Message::Setup(SetupMsg::ClientSecret("sec".into())));
+        let s = a.setup.as_ref().unwrap();
+        assert_eq!(s.client_id, "id");
+        assert_eq!(s.client_secret, "sec");
+    }
+
+    #[test]
+    fn submit_setup_sends_save_credentials_and_marks_submitting() {
+        let (mut a, mut rx) = app();
+        a.setup = Some(SetupState::new("id".into(), "sec".into()));
+        let _ = update(&mut a, Message::SubmitSetup);
+        assert!(a.setup.as_ref().unwrap().submitting);
+        match rx.try_recv() {
+            Ok(Command::SaveCredentials {
+                client_id,
+                client_secret,
+            }) => {
+                assert_eq!(client_id, "id");
+                assert_eq!(client_secret, "sec");
+            }
+            other => panic!("expected SaveCredentials, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn submit_setup_with_blank_fields_errors_and_sends_nothing() {
+        let (mut a, mut rx) = app();
+        a.setup = Some(SetupState::new("id".into(), "   ".into()));
+        let _ = update(&mut a, Message::SubmitSetup);
+        let s = a.setup.as_ref().unwrap();
+        assert!(!s.submitting);
+        assert!(s.error.is_some());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn cancel_setup_closes_the_screen() {
+        let (mut a, _rx) = app();
+        a.setup = Some(SetupState::default());
+        let _ = update(&mut a, Message::CancelSetup);
+        assert!(a.setup.is_none());
+    }
+
+    #[test]
+    fn open_setup_event_prefills_and_opens_window() {
+        let (mut a, _rx) = app();
+        assert!(a.widget.is_none());
+        let _ = update(
+            &mut a,
+            Message::Engine(UiEvent::OpenSetup {
+                client_id: "id".into(),
+                client_secret: "sec".into(),
+            }),
+        );
+        let s = a.setup.as_ref().expect("setup screen opened");
+        assert_eq!(s.client_id, "id");
+        assert_eq!(s.client_secret, "sec");
+        assert!(
+            a.widget.is_some(),
+            "window forced open for the setup screen"
+        );
+    }
+
+    #[test]
+    fn setup_result_ok_closes_screen_err_shows_error() {
+        let (mut a, _rx) = app();
+        a.setup = Some(SetupState::new("id".into(), "sec".into()));
+        a.setup.as_mut().unwrap().submitting = true;
+        let _ = update(&mut a, Message::Engine(UiEvent::SetupResult(Ok(()))));
+        assert!(a.setup.is_none());
+        assert_eq!(a.status, "Connected to Google");
+
+        // Failure keeps the screen and surfaces the error.
+        a.setup = Some(SetupState::new("id".into(), "sec".into()));
+        a.setup.as_mut().unwrap().submitting = true;
+        let _ = update(
+            &mut a,
+            Message::Engine(UiEvent::SetupResult(Err("bad".into()))),
+        );
+        let s = a.setup.as_ref().unwrap();
+        assert!(!s.submitting);
+        assert_eq!(s.error.as_deref(), Some("bad"));
+    }
+
+    #[test]
+    fn view_renders_setup_when_present() {
+        let (mut a, _rx) = app();
+        let _ = update(&mut a, Message::Engine(UiEvent::ToggleWidget));
+        let id = a.widget.unwrap();
+        a.setup = Some(SetupState::new("id".into(), "sec".into()));
+        // Setup takes priority over every other pane.
+        let _ = view(&a, id);
     }
 
     #[test]

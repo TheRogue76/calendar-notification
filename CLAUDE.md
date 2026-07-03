@@ -55,7 +55,7 @@ iced daemon (main thread) ◀── Subscription bridge (static UI_RX) ──
 | `lib.rs` | `run()`: panic hook, rustls provider, config load, channel + thread setup, launches daemon. Exposes all modules so tests can reach them |
 | `main.rs` | Thin wrapper: `fn main() { calendar_notification::run() }` |
 | `config.rs` | TOML config at `~/.config/calendar-notification/config.toml`; XDG paths |
-| `engine.rs` | `UiEvent`/`Command`/`CalendarView` types; sync + scheduler + command hub loop |
+| `engine.rs` | `UiEvent`/`Command`/`CalendarView` types; `Authorizer` trait (builds the client from config on demand); sync + scheduler + command hub loop |
 | `notify.rs` | `notify-rust` reminder wrapper (async) |
 | `icon.rs` | Draws the colored-calendar glyph as RGBA; shared by the tray (repacked to ARGB) and the widget window icon |
 | `tray.rs` | `ksni` tray: menu, per-calendar submenu, sends `Command`s |
@@ -64,8 +64,9 @@ iced daemon (main thread) ◀── Subscription bridge (static UI_RX) ──
 | `ui/add_event.rs` | Add-event form state, view, and `NewEvent` assembly |
 | `ui/detail.rs` | Event detail pane: full event view, edit entry point, delete confirm |
 | `ui/recurrence.rs` | Recurrence presets ↔ RRULE strings (unit-tested) |
+| `ui/setup.rs` | First-run / re-configure screen: paste OAuth client id/secret + GCP-steps help |
 | `google/auth.rs` | `yup-oauth2` InstalledFlow authenticator |
-| `google/client.rs` | `CalendarHub` wrapper: list calendars/events, insert; domain conversion |
+| `google/client.rs` | `CalendarHub` wrapper: list calendars/events, insert; domain conversion; `GoogleAuthorizer` (production `Authorizer`) |
 | `google/model.rs` | Domain types (`Calendar`, `Occurrence`, `NewEvent`, `ReminderRule`) — decoupled from generated API structs |
 
 ## Hard-won gotchas (don't regress these)
@@ -122,9 +123,27 @@ iced daemon (main thread) ◀── Subscription bridge (static UI_RX) ──
   (systemd `Restart=on-failure` restarts it) rather than leaving a zombie with a
   live tray but a dead engine. Prefer converting fallible operations to
   `Result`/`Option`; don't `catch_unwind` for control flow. The same rule covers
-  non-panic startup failures: the engine thread `process::exit(1)`s if the
-  runtime or OAuth can't come up — a bare `return` would leave a windowless
-  iced daemon running invisibly with no tray and no engine.
+  one non-panic startup failure: the engine thread `process::exit(1)`s if the
+  tokio runtime can't be built — a bare `return` would leave a windowless iced
+  daemon running invisibly with no tray and no engine. **OAuth is no longer in
+  that bucket:** missing/failed credentials are a *normal* state now (see the
+  in-app setup gotcha below), so the engine stays up tray-only instead of
+  exiting.
+
+- **In-app setup: "no credentials" is a valid running state.** On a fresh
+  install `lib.rs::run()` no longer prints-and-exits. The engine starts with
+  `client: None` and builds the real `GoogleClient` lazily via the `Authorizer`
+  trait — at startup if `Config::has_credentials()`, otherwise when the setup
+  screen sends `Command::SaveCredentials`. Flow: tray `Configure` → engine emits
+  `UiEvent::OpenSetup{client_id,client_secret}` → `app.rs` opens the window on
+  `ui/setup.rs` → user saves → `Command::SaveCredentials` → engine persists,
+  authorizes, validates via `list_calendars` (this is what triggers the browser
+  consent), then `UiEvent::SetupResult(Ok|Err)`. The tray's `configured` flag
+  gates its menu (reduced Configure+Quit vs. full+Settings) and the engine flips
+  it through the `ksni::Handle`. Changing credentials clears the token cache
+  (`Engine::clear_token_cache`, injectable `token_path` in tests) so a fresh
+  consent runs. Any `self.client` use in the engine must stay guarded on the
+  `Option` — resync is a no-op and the event commands emit `NOT_CONFIGURED`.
 
 - **Both tokio runtimes are deliberately capped at 2 worker threads.** The
   engine runtime (`lib.rs`, `.worker_threads(2)`) and the iced executor
@@ -238,8 +257,10 @@ OAuth credentials and an interactive browser consent, so it can't be fully
 exercised headlessly. What you *can* verify without credentials:
 
 - `cargo test` / `cargo clippy` / `cargo build`.
-- First-run flow: with no `client_id`/`client_secret`, the binary prints the
-  setup instructions and exits (doesn't launch the GUI).
+- First-run flow: with no `client_id`/`client_secret`, the app still launches
+  (tray-only, reduced **Configure… + Quit** menu, no window until the tray opens
+  it) rather than exiting. Entering credentials via **Configure** and the OAuth
+  consent both need a real display/browser, so verify that part by running it.
 
 For anything touching the live flow, describe what you changed and ask the user
 to run it (they have credentials configured), or reason precisely from the code.

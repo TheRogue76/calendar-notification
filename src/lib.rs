@@ -28,7 +28,7 @@ use tracing::{error, info};
 use app::App;
 use config::Config;
 use engine::UiEvent;
-use google::{auth::build_authenticator, client::GoogleClient};
+use google::client::GoogleAuthorizer;
 use tray::CalTray;
 
 /// Install the fail-fast panic hook: any panic on any thread logs (via the
@@ -60,6 +60,9 @@ pub fn run() -> iced::Result {
         )
         .init();
 
+    // Load config, tolerating a first run with no credentials yet: the app comes
+    // up tray-only and the user configures OAuth from the in-app setup screen
+    // (tray → Configure), so there's no longer a print-and-exit path here.
     let cfg = match Config::load_or_create() {
         Ok(c) => c,
         Err(e) => {
@@ -67,19 +70,6 @@ pub fn run() -> iced::Result {
             return Ok(());
         }
     };
-
-    if !cfg.has_credentials() {
-        let path = config::config_path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
-        eprintln!(
-            "\nNo Google OAuth credentials configured yet.\n\
-             Edit {path}\n\
-             and set `client_id` and `client_secret` (see README.md → Google Cloud setup),\n\
-             then run `calendar-notification` again.\n"
-        );
-        return Ok(());
-    }
 
     // Channels between the UI (main thread) and the engine (background runtime).
     let (cmd_tx, cmd_rx) = unbounded_channel::<engine::Command>();
@@ -109,23 +99,14 @@ pub fn run() -> iced::Result {
                 }
             };
             rt.block_on(async move {
-                // Bring the tray up first so the icon appears immediately, even
-                // while first-run OAuth consent is happening in the browser.
+                // Bring the tray up first so the icon appears immediately. The
+                // engine builds the Google client lazily: right away if
+                // credentials are already saved, otherwise once the user
+                // completes the in-app setup (so a fresh install still gets a
+                // working tray instead of exiting).
                 let tray = CalTray::new(bg_cmd_tx.clone()).spawn_tray().await;
-
-                let auth = match build_authenticator(&cfg).await {
-                    Ok(a) => a,
-                    Err(e) => {
-                        // Same fail-fast rationale as the panic hook: without an
-                        // engine the daemon is an invisible zombie (no tray, no
-                        // window), so exit and let systemd restart us.
-                        error!("OAuth failed: {e:#}");
-                        std::process::exit(1);
-                    }
-                };
-                let client = GoogleClient::new(auth);
                 info!("engine starting");
-                engine::run(cfg, client, ui_tx, cmd_rx, tray).await;
+                engine::run(cfg, GoogleAuthorizer, ui_tx, cmd_rx, tray).await;
                 info!("engine stopped; exiting");
                 std::process::exit(0);
             });
