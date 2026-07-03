@@ -133,6 +133,14 @@ iced daemon (main thread) ◀── Subscription bridge (static UI_RX) ──
   threads / ~145 MB RSS on a 16-core machine for a workload of a few HTTP calls
   per poll. Don't swap in `Runtime::new()` or drop the `.executor(...)` call.
 
+- **The widget renders with tiny-skia (software), not wgpu — on purpose.**
+  `Cargo.toml` builds iced with `default-features = false` to exclude the wgpu
+  GPU renderer: with wgpu, the first widget open mapped ~130 MB of Vulkan
+  driver + LLVM (lavapipe software-Vulkan) libraries into the process and
+  spiked RSS to ~220 MB. tiny-skia renders the same UI identically for ~24 MB
+  per open window. Don't re-enable iced's default features or add the `wgpu`
+  feature without re-measuring (`make perf` open/closed).
+
 - **Google list calls use partial-response `fields` masks.**
   `client.rs::EVENT_LIST_FIELDS` / `CALENDAR_LIST_FIELDS` name exactly the JSON
   fields the conversions read. If you make `to_occurrence`/`list_calendars` read
@@ -212,17 +220,16 @@ failing test and investigate before finishing:
 - **CPU**: effectively zero while idle (~0.2 s CPU per 15 min uptime).
 - **Threads**: single digits. 30+ means a runtime lost its 2-worker cap (see
   the gotcha above).
-- **Release binary**: ~21 MB (thin LTO + stripped symbols via
-  `[profile.release]`; it was 33 MB untuned).
-- **RSS**: ~21 MB idle with the widget window closed (measured 2026-07-03; the
-  uncapped build idled at ~145 MB). Opening the widget adds renderer memory
-  while it's open — judge idle RSS with the window closed.
+- **Release binary**: ~16 MB (thin LTO + stripped symbols via
+  `[profile.release]`, no wgpu; it was 33 MB untuned).
+- **RSS**: ~21 MB idle before the widget is first opened; ~45 MB with the
+  widget open; settles ~43 MB after it closes (retained pages are shared,
+  clean font/library mappings — private/Anonymous stays under ~8 MB). Repeated
+  open/close must not ratchet. (All measured 2026-07-03 with tiny-skia; the
+  pre-tuning wgpu build idled at ~145 MB and spiked to ~220 MB on window open.)
 
 For allocation-level analysis use `make heaptrack` (stop the user service
-first so you don't register a second tray). Known remaining lever, not yet
-applied: dropping iced's `wgpu` feature in favor of tiny-skia software
-rendering — cuts GPU memory + binary size but needs a visual check of the
-widget before committing to it.
+first so you don't register a second tray).
 
 ## Verifying changes
 
