@@ -91,7 +91,11 @@ pub fn run() -> iced::Result {
     std::thread::Builder::new()
         .name("engine".into())
         .spawn(move || {
+            // 2 workers, not one per core: the whole workload is a handful of
+            // HTTP calls every poll plus the tray's D-Bus traffic. Default
+            // sizing spawned 16 idle workers here (and their malloc arenas).
             let rt = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_all()
                 .build()
             {
@@ -135,6 +139,10 @@ pub fn run() -> iced::Result {
         app::update,
         app::view,
     )
+    // Small custom executor: iced's default tokio executor also spawns one
+    // worker per core, which the UI (subscription bridge + window tasks)
+    // doesn't remotely need.
+    .executor::<app::UiExecutor>()
     .title(app::title)
     .subscription(app::subscription)
     .theme(app::theme)

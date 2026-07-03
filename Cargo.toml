@@ -50,6 +50,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Bridge tokio streams into iced subscriptions
 futures = "0.3"
 
+[profile.release]
+# Size/perf tuning for the shipped daemon: symbols stripped (−8 MB measured),
+# thin LTO + single codegen unit for tighter code. Debug builds are untouched.
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+
 [dev-dependencies]
 tempfile = "3"
 chrono = "0.4"

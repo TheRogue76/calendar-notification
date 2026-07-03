@@ -17,6 +17,14 @@ use super::model::{Calendar, EventDetails, NewEvent, Occurrence, ReminderRule};
 
 type Hub = CalendarHub<HttpsConnector<HttpConnector>>;
 
+/// `fields` masks for Google's partial-response support: fetch only what the
+/// domain conversions actually read (the JSON — camelCase — field names).
+/// Keep in sync with [`to_occurrence`] / `list_calendars`; a field named here
+/// but missing server-side is a 400, so test any change against the live API.
+const EVENT_LIST_FIELDS: &str =
+    "items(id,recurringEventId,summary,location,start,end,reminders),defaultReminders";
+const CALENDAR_LIST_FIELDS: &str = "items(id,summary,backgroundColor,primary,deleted,accessRole)";
+
 pub struct GoogleClient {
     hub: Hub,
 }
@@ -45,6 +53,8 @@ impl crate::engine::CalendarSource for GoogleClient {
             .hub
             .calendar_list()
             .list()
+            // Partial response: only the fields the conversion below reads.
+            .param("fields", CALENDAR_LIST_FIELDS)
             .doit()
             .await
             .context("listing calendars")?;
@@ -92,6 +102,10 @@ impl crate::engine::CalendarSource for GoogleClient {
             .time_max(time_max)
             .single_events(true)
             .order_by("startTime")
+            // Partial response: full event resources carry description,
+            // attendee lists, conference data, etc. on every poll, while
+            // `to_occurrence` only reads these fields.
+            .param("fields", EVENT_LIST_FIELDS)
             .doit()
             .await;
 

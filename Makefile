@@ -21,7 +21,8 @@ TARGET      := target/release/$(BIN)
 .DEFAULT_GOAL := help
 
 .PHONY: help build run install install-desktop install-service \
-        uninstall uninstall-service check fmt clippy test coverage clean
+        uninstall uninstall-service check fmt clippy test coverage clean \
+        perf heaptrack
 
 help: ## Show this help
 	@echo "calendar-notification — make targets:"
@@ -74,6 +75,23 @@ test: ## Run the test suite
 
 coverage: ## Print line-coverage summary
 	cargo llvm-cov --summary-only
+
+perf: ## Snapshot release binary size + running daemon CPU/RSS/threads
+	@if [ -f $(TARGET) ]; then \
+		ls -l $(TARGET) | awk '{printf "release binary: %.1f MB\n", $$5 / 1048576}'; \
+	else \
+		echo "no release binary yet — run: make build"; \
+	fi
+	@pid=$$(pgrep -f "$(BIN)$$" | head -1); \
+	if [ -n "$$pid" ]; then \
+		ps -o pid,etime,time,%cpu,rss,nlwp -p $$pid; \
+	else \
+		echo "daemon not running (start it, or: systemctl --user start $(BIN))"; \
+	fi
+
+heaptrack: build ## Profile allocations with heaptrack (stop the service first)
+	@echo "Tip: systemctl --user stop $(BIN)  # avoid a second tray instance"
+	heaptrack $(TARGET)
 
 clean: ## Remove build artifacts
 	cargo clean
