@@ -340,10 +340,17 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::OpenSetupConsole => {
             // Best-effort: hand the console URL to the desktop's URL opener.
-            // Not unit-tested (spawns an external process); a failure is benign.
-            let _ = std::process::Command::new("xdg-open")
+            // Reap the child in a detached thread so a quick-exiting `xdg-open`
+            // doesn't linger as a zombie (std's Child doesn't wait on drop); we
+            // don't care about the result. Not unit-tested (external process).
+            if let Ok(mut child) = std::process::Command::new("xdg-open")
                 .arg(setup::CONSOLE_URL)
-                .spawn();
+                .spawn()
+            {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
             Task::none()
         }
     }
