@@ -259,23 +259,28 @@ impl<A: Authorizer> Engine<A> {
         self.emit(UiEvent::Status("Connecting to Google…".into()));
         let client = match self.authorizer.authorize(&self.config).await {
             Ok(client) => client,
-            Err(e) => {
-                self.emit(UiEvent::SetupResult(Err(format!("{e:#}"))));
-                return;
-            }
+            Err(e) => return self.fail_setup(&e),
         };
         // Validating by actually listing calendars is what drives the OAuth
         // consent flow on first run; a failure here means bad credentials, a
         // denied consent, or no network.
         if let Err(e) = client.list_calendars().await {
-            self.emit(UiEvent::SetupResult(Err(format!("{e:#}"))));
-            return;
+            return self.fail_setup(&e);
         }
 
         self.client = Some(client);
         self.set_tray_configured(true).await;
         self.emit(UiEvent::SetupResult(Ok(())));
         self.resync().await;
+    }
+
+    /// Report a failed setup attempt: send the error to the setup screen and
+    /// clear the transient "Connecting…" status, so the agenda doesn't stay
+    /// stuck on it if the screen is closed (the setup screen swallows
+    /// `SetupResult` once dismissed, but `Status` always applies).
+    fn fail_setup(&self, err: &anyhow::Error) {
+        self.emit(UiEvent::Status("Setup failed — not connected".into()));
+        self.emit(UiEvent::SetupResult(Err(format!("{err:#}"))));
     }
 
     /// Publish the current calendar list (with prefs applied) to the UI and
@@ -1443,6 +1448,12 @@ mod tests {
         assert!(evs
             .iter()
             .any(|ev| matches!(ev, UiEvent::SetupResult(Err(_)))));
+        // The status must move off "Connecting…" so a closed screen doesn't
+        // leave the agenda stuck showing it.
+        assert!(matches!(evs.last(), Some(UiEvent::SetupResult(Err(_)))));
+        assert!(evs
+            .iter()
+            .any(|ev| matches!(ev, UiEvent::Status(s) if !s.contains("Connecting"))));
     }
 
     #[tokio::test]
@@ -1461,5 +1472,9 @@ mod tests {
         assert!(evs
             .iter()
             .any(|ev| matches!(ev, UiEvent::SetupResult(Err(_)))));
+        // Status is cleared off "Connecting…" on failure.
+        assert!(evs
+            .iter()
+            .any(|ev| matches!(ev, UiEvent::Status(s) if s.contains("failed"))));
     }
 }
