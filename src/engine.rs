@@ -354,10 +354,12 @@ impl<A: Authorizer> Engine<A> {
 
         // Fetch every relevant calendar concurrently rather than serializing a
         // network round-trip per calendar (holiday/shared calendars add up).
-        let client = self
-            .client
-            .as_ref()
-            .expect("resync reached the fetch phase, so a client is present");
+        // Re-borrow the client (the borrow above couldn't be held across the
+        // config/calendar mutations); degrade to a no-op rather than panic if it
+        // somehow went away, matching the guard at the top of resync.
+        let Some(client) = self.client.as_ref() else {
+            return;
+        };
         let fetches = self.calendars.iter().filter_map(|c| {
             let prefs = self.config.calendars.get(&c.id);
             let visible = prefs.map(|p| p.visible).unwrap_or(true);
