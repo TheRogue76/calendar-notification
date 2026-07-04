@@ -119,12 +119,12 @@ fn form_view(state: &SetupState) -> Element<'_, Message> {
     if !state.submitting {
         save = save.on_press(Message::SubmitSetup);
     }
-    // Cancel stays active even while submitting — on purpose. The engine handles
-    // SaveCredentials by blocking on the interactive OAuth consent, so during a
-    // slow/abandoned sign-in the engine (and thus the tray) is unresponsive;
-    // Cancel is a pure UI-thread message, so it's the user's only escape from the
-    // "Connecting…" screen. It closes the screen but can't abort the in-flight
-    // OAuth — a genuine abort needs the non-blocking rework tracked separately.
+    // Cancel stays active even while submitting — on purpose. It closes the
+    // screen and sends `Command::CancelSetup`, which the engine handles off its
+    // select loop by dropping the in-flight authorize future: a genuine abort of
+    // the OAuth consent, not just a UI dismissal. The engine polls the setup work
+    // as a select arm (never awaits it inline), so the tray stays responsive
+    // during a slow/abandoned sign-in.
     let cancel = button("Cancel").on_press(Message::CancelSetup);
     content = content.push(row![iced::widget::space::horizontal(), cancel, save].spacing(8));
 

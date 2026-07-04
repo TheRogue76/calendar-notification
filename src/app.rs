@@ -335,7 +335,11 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::CancelSetup => {
+            // Close the setup screen and tell the engine to abort any in-flight
+            // OAuth (harmless if none is pending). Before the engine's
+            // non-blocking rework this couldn't truly abort the flow; now it does.
             app.setup = None;
+            app.send(Command::CancelSetup);
             Task::none()
         }
         Message::OpenSetupConsole => {

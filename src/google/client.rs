@@ -49,6 +49,7 @@ impl GoogleClient {
 /// Builds a live [`GoogleClient`] from the config's OAuth credentials. This is
 /// the production [`crate::engine::Authorizer`]; the engine holds one and calls
 /// it once the user has entered (or already saved) their credentials.
+#[derive(Clone)]
 pub struct GoogleAuthorizer;
 
 impl crate::engine::Authorizer for GoogleAuthorizer {
