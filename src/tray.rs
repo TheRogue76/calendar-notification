@@ -22,6 +22,9 @@ pub struct CalTray {
     pub tx: UnboundedSender<Command>,
     pub calendars: Vec<CalendarView>,
     pub next_event: Option<NextEvent>,
+    /// Whether OAuth credentials are configured. While `false` the menu reduces
+    /// to just *Configure…* + *Quit*; the engine flips it once setup succeeds.
+    pub configured: bool,
 }
 
 impl CalTray {
@@ -30,6 +33,7 @@ impl CalTray {
             tx,
             calendars: Vec::new(),
             next_event: None,
+            configured: false,
         }
     }
 
@@ -80,6 +84,28 @@ impl Tray for CalTray {
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
+        // Before setup is complete there's nothing to sync or filter, so the
+        // menu is just a way in to the credential screen (plus Quit).
+        if !self.configured {
+            return vec![
+                StandardItem {
+                    label: "Configure…".into(),
+                    icon_name: "preferences-system".into(),
+                    activate: Box::new(|t: &mut Self| t.send(Command::Configure)),
+                    ..Default::default()
+                }
+                .into(),
+                MenuItem::Separator,
+                StandardItem {
+                    label: "Quit".into(),
+                    icon_name: "application-exit".into(),
+                    activate: Box::new(|t: &mut Self| t.send(Command::Quit)),
+                    ..Default::default()
+                }
+                .into(),
+            ];
+        }
+
         let mut items: Vec<MenuItem<Self>> = Vec::new();
 
         // "Up next" label at the top: a disabled item so it reads as text, not a
@@ -173,6 +199,15 @@ impl Tray for CalTray {
             items.push(MenuItem::Separator);
         }
 
+        items.push(
+            StandardItem {
+                label: "Settings".into(),
+                icon_name: "preferences-system".into(),
+                activate: Box::new(|t: &mut Self| t.send(Command::Configure)),
+                ..Default::default()
+            }
+            .into(),
+        );
         items.push(
             StandardItem {
                 label: "Quit".into(),
@@ -344,6 +379,7 @@ mod tests {
     fn menu_shows_next_event_when_set() {
         let (tx, _rx) = unbounded_channel();
         let mut t = CalTray::new(tx);
+        t.configured = true;
         assert!(t.next_event.is_none());
         // Without a next event, the first item is a regular action, not "Next:".
         assert!(!first_label(&t.menu()).unwrap().starts_with("Next:"));
@@ -359,7 +395,8 @@ mod tests {
     #[test]
     fn menu_without_calendars_has_no_submenu() {
         let (tx, _rx) = unbounded_channel();
-        let t = CalTray::new(tx);
+        let mut t = CalTray::new(tx);
+        t.configured = true;
         let items = t.menu();
         assert!(!has_submenu(&items, "Calendars"));
     }
@@ -368,14 +405,45 @@ mod tests {
     fn menu_with_calendars_has_submenu() {
         let (tx, _rx) = unbounded_channel();
         let mut t = CalTray::new(tx);
+        t.configured = true;
         t.calendars = vec![view("p"), view("w")];
         assert!(has_submenu(&t.menu(), "Calendars"));
+    }
+
+    #[test]
+    fn unconfigured_menu_offers_only_configure_and_quit() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut t = CalTray::new(tx);
+        assert!(!t.configured, "default is unconfigured");
+        let items = t.menu();
+        // No agenda controls or calendar submenu before setup.
+        assert!(!has_submenu(&items, "Calendars"));
+        invoke_all(items, &mut t);
+        let cmds = drain(&mut rx);
+        assert!(cmds.iter().any(|c| matches!(c, Command::Configure)));
+        assert!(cmds.iter().any(|c| matches!(c, Command::Quit)));
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Command::SyncNow)),
+            "no Sync now while unconfigured"
+        );
+    }
+
+    #[test]
+    fn configured_menu_includes_settings_entry() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut t = CalTray::new(tx);
+        t.configured = true;
+        invoke_all(t.menu(), &mut t);
+        let cmds = drain(&mut rx);
+        // The Settings item reuses Command::Configure to reopen the setup screen.
+        assert!(cmds.iter().any(|c| matches!(c, Command::Configure)));
     }
 
     #[test]
     fn activating_items_sends_commands() {
         let (tx, mut rx) = unbounded_channel();
         let mut t = CalTray::new(tx);
+        t.configured = true;
         t.calendars = vec![view("p")];
         let items = t.menu();
         invoke_all(items, &mut t);

@@ -45,23 +45,19 @@ create it once in the Google Cloud Console:
    (Staying in "Testing" mode avoids Google's app-verification requirement.)
 4. **APIs & Services → Credentials → Create credentials → OAuth client ID →**
    choose **Desktop app**. Copy the **Client ID** and **Client secret**.
-5. Run the app once to generate the config file, then paste the two values in:
-
-   ```bash
-   calendar-notification          # prints the config path and exits on first run
-   ```
-
-   Edit `~/.config/calendar-notification/config.toml`:
-
-   ```toml
-   client_id = "xxxxxxxx.apps.googleusercontent.com"
-   client_secret = "xxxxxxxxxxxxxxxxx"
-   poll_interval_minutes = 5
-   ```
-
-6. Run it again. A browser window opens for consent; approve it. The refresh
+5. Launch the app (`calendar-notification`). On a fresh install the tray shows
+   just **Configure…** and **Quit** — click **Configure…**, paste the **Client
+   ID** and **Client secret** into the setup screen, and press **Save**. (The
+   screen has a **Learn more** button with these same steps and a link to the
+   console.)
+6. A browser window opens for consent; approve it. The setup screen closes,
+   today's agenda appears, and the tray switches to its full menu. The refresh
    token is cached at `~/.local/share/calendar-notification/token.json` and
-   reused automatically on later runs.
+   reused automatically on later runs, so you won't be prompted again.
+
+   > Prefer editing the file by hand? You can still put `client_id` /
+   > `client_secret` straight into `~/.config/calendar-notification/config.toml`
+   > — the setup screen just writes the same file for you.
 
 ## Run
 
@@ -69,11 +65,13 @@ create it once in the Google Cloud Console:
 calendar-notification
 ```
 
-A calendar icon appears in the tray. Its menu:
+A calendar icon appears in the tray. Before setup its menu is just **Configure…**
++ **Quit**; once credentials are saved it becomes:
 
 - **Show / hide widget** — toggle the agenda window.
 - **Sync now** — force a refresh.
 - **Calendars** — per-calendar **Visible in agenda** / **Notify** toggles.
+- **Settings** — reopen the credential setup screen (fix a typo / switch account).
 - **Quit**.
 
 Closing the widget with its titlebar **✕** just hides it — the daemon (tray +

@@ -393,7 +393,7 @@ pub fn view<'a>(form: &'a FormState, calendars: &'a [CalendarView]) -> Element<'
     }
 
     if let Some(err) = &form.error {
-        content = content.push(text(err.clone()).size(13));
+        content = content.push(text(err.as_str()).size(13));
     }
 
     let submit_label = if form.submitting {
