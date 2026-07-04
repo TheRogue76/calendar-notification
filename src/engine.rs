@@ -7,7 +7,9 @@
 //! for making ksni + iced coexist cleanly.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 
 use anyhow::Result;
 use chrono::{DateTime, Duration, Local, Utc};
@@ -154,9 +156,19 @@ pub enum Command {
         client_id: String,
         client_secret: String,
     },
+    /// Abort an in-flight setup/OAuth attempt started by [`Command::SaveCredentials`].
+    /// The engine drops the pending authorize future, which cancels the OAuth flow
+    /// (localhost listener + browser consent) cleanly.
+    CancelSetup,
     /// Shut everything down.
     Quit,
 }
+
+/// The in-flight authorize + validate work for a [`Command::SaveCredentials`],
+/// held on the engine and polled as a `select!` arm so the loop (and thus the
+/// tray) stays responsive during the interactive OAuth consent. Dropping it —
+/// via [`Command::CancelSetup`] or a superseding save — aborts the OAuth flow.
+type PendingSetup<S> = Pin<Box<dyn Future<Output = Result<S>>>>;
 
 /// The next reminder due to fire, as chosen by [`Engine::next_reminder`].
 #[derive(Debug, Clone)]
@@ -193,9 +205,15 @@ struct Engine<A: Authorizer> {
     occurrences: Vec<Occurrence>,
     /// Dedup set of already-fired reminders (occurrence_key + minutes).
     fired: HashSet<String>,
+    /// In-flight setup (authorize + validate) future, or `None` when no setup is
+    /// running. Polled as a `select!` arm; dropping it aborts the OAuth flow.
+    pending_setup: Option<PendingSetup<A::Source>>,
 }
 
-impl<A: Authorizer> Engine<A> {
+impl<A: Authorizer + Clone + 'static> Engine<A>
+where
+    A::Source: 'static,
+{
     /// Persist config to the injected path (tests) or the default XDG location.
     fn save_config(&self) {
         let result = match &self.config_path {
@@ -245,11 +263,17 @@ impl<A: Authorizer> Engine<A> {
         }
     }
 
-    /// Persist freshly entered credentials, authorize, and — once we've actually
-    /// reached Google (which triggers the first-run browser consent) — start
-    /// syncing. On any failure the credentials stay saved and the error is sent
-    /// back for the setup screen to show, without disturbing an existing client.
-    async fn save_credentials(&mut self, client_id: String, client_secret: String) {
+    /// Persist freshly entered credentials and kick off authorize + validation as
+    /// a *non-blocking* pending future (polled by the run loop), rather than
+    /// awaiting the interactive OAuth consent inline. This keeps the engine — and
+    /// so the tray — responsive during consent, and lets [`Command::CancelSetup`]
+    /// genuinely abort the attempt by dropping the future. The credentials are
+    /// persisted up front so they survive a failed/cancelled attempt for a retry.
+    ///
+    /// The future owns cloned copies of the authorizer and config so it borrows
+    /// nothing from `self` (a stored future can't borrow the struct that holds
+    /// it); [`Engine::finish_setup`] applies its result once it resolves.
+    fn begin_setup(&mut self, client_id: String, client_secret: String) {
         let changed =
             client_id != self.config.client_id || client_secret != self.config.client_secret;
         self.config.client_id = client_id;
@@ -260,21 +284,43 @@ impl<A: Authorizer> Engine<A> {
         }
 
         self.emit(UiEvent::Status("Connecting to Google…".into()));
-        let client = match self.authorizer.authorize(&self.config).await {
-            Ok(client) => client,
-            Err(e) => return self.fail_setup(&e),
-        };
-        // Validating by actually listing calendars is what drives the OAuth
-        // consent flow on first run; a failure here means bad credentials, a
-        // denied consent, or no network.
-        if let Err(e) = client.list_calendars().await {
-            return self.fail_setup(&e);
-        }
+        let authorizer = self.authorizer.clone();
+        let cfg = self.config.clone();
+        self.pending_setup = Some(Box::pin(async move {
+            let client = authorizer.authorize(&cfg).await?;
+            // Validating by actually listing calendars is what drives the OAuth
+            // consent flow on first run; a failure here means bad credentials, a
+            // denied consent, or no network.
+            client.list_calendars().await?;
+            Ok(client)
+        }));
+    }
 
-        self.client = Some(client);
-        self.set_tray_configured(true).await;
-        self.emit(UiEvent::SetupResult(Ok(())));
-        self.resync().await;
+    /// Apply the result of the pending setup future (see [`Engine::begin_setup`]),
+    /// run on the engine thread once it resolves. On success wire up the client
+    /// and start syncing; on failure report it without disturbing an existing
+    /// client (the credentials stay saved for a retry).
+    async fn finish_setup(&mut self, outcome: Result<A::Source>) {
+        match outcome {
+            Ok(client) => {
+                self.client = Some(client);
+                self.set_tray_configured(true).await;
+                self.emit(UiEvent::SetupResult(Ok(())));
+                self.resync().await;
+            }
+            Err(e) => self.fail_setup(&e),
+        }
+    }
+
+    /// Test helper: drive the pending setup future to completion and apply its
+    /// result, mirroring what the run loop's `select!` arm does. Lets the setup
+    /// tests exercise the full begin→finish path without spinning the loop.
+    #[cfg(test)]
+    async fn drive_pending_setup(&mut self) {
+        if let Some(fut) = self.pending_setup.take() {
+            let outcome = fut.await;
+            self.finish_setup(outcome).await;
+        }
     }
 
     /// Report a failed setup attempt: send the error to the setup screen and
@@ -634,7 +680,16 @@ impl<A: Authorizer> Engine<A> {
             Command::SaveCredentials {
                 client_id,
                 client_secret,
-            } => self.save_credentials(client_id, client_secret).await,
+            } => self.begin_setup(client_id, client_secret),
+            // Drop the in-flight authorize future: cancellation on drop tears down
+            // the OAuth flow (localhost listener + browser consent). Clear the
+            // lingering "Connecting…" status so the agenda doesn't stay stuck on
+            // it. A no-op if no setup is pending.
+            Command::CancelSetup => {
+                if self.pending_setup.take().is_some() {
+                    self.emit(UiEvent::Status("Setup cancelled".into()));
+                }
+            }
             Command::Quit => {
                 self.emit(UiEvent::Quit);
                 return false;
@@ -655,13 +710,15 @@ fn deadline_for(fire: DateTime<Utc>) -> Instant {
 /// Run the engine loop until a Quit command. Consumes the command receiver.
 /// Starts with no client; if credentials are already configured it builds one,
 /// otherwise it waits tray-only for the user to complete setup.
-pub async fn run<A: Authorizer>(
+pub async fn run<A: Authorizer + Clone + 'static>(
     config: Config,
     authorizer: A,
     ui_tx: UnboundedSender<UiEvent>,
     cmd_rx: UnboundedReceiver<Command>,
     tray: Option<ksni::Handle<CalTray>>,
-) {
+) where
+    A::Source: 'static,
+{
     let engine = Engine {
         config,
         client: None,
@@ -673,13 +730,29 @@ pub async fn run<A: Authorizer>(
         calendars: Vec::new(),
         occurrences: Vec::new(),
         fired: HashSet::new(),
+        pending_setup: None,
     };
     run_loop(engine, cmd_rx).await;
 }
 
+/// The pending-setup arm's future: resolve the stored authorize future if one is
+/// in flight, otherwise stay dormant (the arm is `if`-guarded so this branch is
+/// never actually created while `pending_setup` is `None`).
+async fn poll_pending_setup<S>(pending: &mut Option<PendingSetup<S>>) -> Result<S> {
+    match pending {
+        Some(fut) => fut.await,
+        None => std::future::pending().await,
+    }
+}
+
 /// The engine's event loop, split out so tests can drive a hand-built engine
 /// (with a fake source and an injected config path).
-async fn run_loop<A: Authorizer>(mut engine: Engine<A>, mut cmd_rx: UnboundedReceiver<Command>) {
+async fn run_loop<A: Authorizer + Clone + 'static>(
+    mut engine: Engine<A>,
+    mut cmd_rx: UnboundedReceiver<Command>,
+) where
+    A::Source: 'static,
+{
     let poll_every = TokioDuration::from_secs(
         engine
             .config
@@ -749,6 +822,16 @@ async fn run_loop<A: Authorizer>(mut engine: Engine<A>, mut cmd_rx: UnboundedRec
                     engine.fire_reminder(r.idx, r.minutes, r.key).await;
                 }
             }
+            // In-flight setup finished (or failed). Polled here — not awaited
+            // inline in the `cmd` arm — so the loop stays responsive to other
+            // commands (SyncNow/Configure/Quit) and to CancelSetup during the
+            // interactive OAuth consent. The arm's future borrows only
+            // `pending_setup` and `select!` drops it before running this body,
+            // so `finish_setup` gets full access to `engine`.
+            outcome = poll_pending_setup(&mut engine.pending_setup), if engine.pending_setup.is_some() => {
+                engine.pending_setup = None;
+                engine.finish_setup(outcome).await;
+            }
         }
     }
 
@@ -762,8 +845,9 @@ mod tests {
     use crate::config::CalendarPrefs;
     use crate::google::model::ReminderRule;
     use chrono::TimeZone;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc::unbounded_channel;
+    use tokio::sync::Notify;
 
     // -- fake source ---------------------------------------------------------
 
@@ -855,12 +939,16 @@ mod tests {
     /// Stands in for `GoogleAuthorizer` in the setup flow: hands back a
     /// `FakeSource` (optionally one whose `list_calendars` fails, to exercise the
     /// validation-failure path) or fails outright.
+    #[derive(Clone)]
     struct FakeAuthorizer {
         calendars: Vec<Calendar>,
         /// `authorize()` itself fails (e.g. building the authenticator).
         fail: bool,
         /// The produced source's `list_calendars` fails (validation failure).
         source_fail: bool,
+        /// When set, `authorize()` blocks on this until notified — lets a test
+        /// hold the setup future "in flight" to exercise responsiveness/cancel.
+        gate: Option<Arc<Notify>>,
     }
 
     impl FakeAuthorizer {
@@ -869,6 +957,7 @@ mod tests {
                 calendars,
                 fail: false,
                 source_fail: false,
+                gate: None,
             }
         }
         fn failing() -> Self {
@@ -876,6 +965,7 @@ mod tests {
                 calendars: Vec::new(),
                 fail: true,
                 source_fail: false,
+                gate: None,
             }
         }
         fn source_failing() -> Self {
@@ -883,13 +973,24 @@ mod tests {
                 calendars: Vec::new(),
                 fail: false,
                 source_fail: true,
+                gate: None,
             }
+        }
+        /// Block `authorize()` until the returned gate is notified.
+        fn gated(calendars: Vec<Calendar>) -> (Self, Arc<Notify>) {
+            let gate = Arc::new(Notify::new());
+            let mut me = Self::ok(calendars);
+            me.gate = Some(gate.clone());
+            (me, gate)
         }
     }
 
     impl Authorizer for FakeAuthorizer {
         type Source = FakeSource;
         async fn authorize(&self, _cfg: &Config) -> Result<FakeSource> {
+            if let Some(gate) = &self.gate {
+                gate.notified().await;
+            }
             if self.fail {
                 anyhow::bail!("authorize failed");
             }
@@ -950,6 +1051,7 @@ mod tests {
             calendars: Vec::new(),
             occurrences: Vec::new(),
             fired: HashSet::new(),
+            pending_setup: None,
         };
         (engine, ui_rx, dir)
     }
@@ -1421,6 +1523,10 @@ mod tests {
             client_secret: "secret".into(),
         })
         .await;
+        // `SaveCredentials` now only starts the pending setup; drive it to
+        // completion as the run loop's select arm would.
+        assert!(e.pending_setup.is_some(), "setup is in flight after save");
+        e.drive_pending_setup().await;
 
         assert!(e.client.is_some(), "client built after successful setup");
         assert!(e.config.has_credentials());
@@ -1444,6 +1550,7 @@ mod tests {
             client_secret: "secret".into(),
         })
         .await;
+        e.drive_pending_setup().await;
         assert!(e.client.is_none(), "no client when authorize fails");
         // Credentials are still saved so the user can retry from the screen.
         assert!(e.config.has_credentials());
@@ -1467,6 +1574,7 @@ mod tests {
             client_secret: "secret".into(),
         })
         .await;
+        e.drive_pending_setup().await;
         assert!(
             e.client.is_none(),
             "credentials that can't reach Google don't become the live client"
@@ -1479,5 +1587,105 @@ mod tests {
         assert!(evs
             .iter()
             .any(|ev| matches!(ev, UiEvent::Status(s) if s.contains("failed"))));
+    }
+
+    #[tokio::test]
+    async fn cancel_setup_drops_pending_future_and_stays_unconfigured() {
+        let (mut e, mut rx, _d) =
+            setup_engine(FakeAuthorizer::ok(vec![cal("p", true)]), Config::default());
+        e.begin_setup("id".into(), "secret".into());
+        assert!(e.pending_setup.is_some(), "setup is in flight after begin");
+
+        e.handle_command(Command::CancelSetup).await;
+
+        assert!(e.pending_setup.is_none(), "cancel drops the pending future");
+        assert!(e.client.is_none(), "cancel leaves us unconfigured");
+        let evs = drain(&mut rx);
+        assert!(
+            !evs.iter()
+                .any(|ev| matches!(ev, UiEvent::SetupResult(Ok(())))),
+            "a cancelled setup never reports success"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_loop_applies_setup_off_the_select_arm() {
+        // The loop must complete setup via its pending-setup select arm (not an
+        // inline await), emitting SetupResult(Ok) without any CancelSetup.
+        let (engine, mut rx, _d) =
+            setup_engine(FakeAuthorizer::ok(vec![cal("p", true)]), Config::default());
+        let (cmd_tx, cmd_rx) = unbounded_channel();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let handle = tokio::task::spawn_local(run_loop(engine, cmd_rx));
+                cmd_tx
+                    .send(Command::SaveCredentials {
+                        client_id: "id".into(),
+                        client_secret: "secret".into(),
+                    })
+                    .unwrap();
+                // Wait until the loop applies the setup, then quit. Sending Quit
+                // only after the result avoids racing the select arm.
+                let mut ok = false;
+                while let Some(ev) = rx.recv().await {
+                    if matches!(ev, UiEvent::SetupResult(Ok(()))) {
+                        ok = true;
+                        break;
+                    }
+                }
+                assert!(ok, "setup completed through the select arm");
+                cmd_tx.send(Command::Quit).unwrap();
+                handle.await.unwrap();
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn run_loop_cancel_aborts_in_flight_setup() {
+        // With a gated authorizer the setup future stays pending; CancelSetup must
+        // drop it so that even opening the gate afterwards can't connect.
+        let (authorizer, gate) = FakeAuthorizer::gated(vec![cal("p", true)]);
+        let (engine, mut rx, _d) = setup_engine(authorizer, Config::default());
+        let (cmd_tx, cmd_rx) = unbounded_channel();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let handle = tokio::task::spawn_local(run_loop(engine, cmd_rx));
+                cmd_tx
+                    .send(Command::SaveCredentials {
+                        client_id: "id".into(),
+                        client_secret: "secret".into(),
+                    })
+                    .unwrap();
+                // Wait for the "Connecting…" status so we know begin_setup ran and
+                // the loop is parked on the gated authorize.
+                while let Some(ev) = rx.recv().await {
+                    if matches!(ev, UiEvent::Status(s) if s.contains("Connecting")) {
+                        break;
+                    }
+                }
+                // The loop processes CancelSetup despite the pending setup (proving
+                // it stays responsive); wait for the cancel to land before opening
+                // the gate so the drop is guaranteed to have happened.
+                cmd_tx.send(Command::CancelSetup).unwrap();
+                while let Some(ev) = rx.recv().await {
+                    if matches!(ev, UiEvent::Status(s) if s.contains("cancelled")) {
+                        break;
+                    }
+                }
+                // Opening the gate now is too late — the future was dropped.
+                gate.notify_waiters();
+                cmd_tx.send(Command::Quit).unwrap();
+                handle.await.unwrap();
+
+                let evs = drain(&mut rx);
+                assert!(
+                    !evs.iter()
+                        .any(|ev| matches!(ev, UiEvent::SetupResult(Ok(())))),
+                    "a cancelled setup never connects, even if the gate opens afterward"
+                );
+            })
+            .await;
     }
 }

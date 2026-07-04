@@ -145,6 +145,22 @@ iced daemon (main thread) ◀── Subscription bridge (static UI_RX) ──
   consent runs. Any `self.client` use in the engine must stay guarded on the
   `Option` — resync is a no-op and the event commands emit `NOT_CONFIGURED`.
 
+- **Setup authorize is non-blocking; Cancel truly aborts.** The interactive OAuth
+  consent must *never* be `await`ed inline in the engine's `select!` loop — that
+  would freeze the loop (and the tray) until the user finishes/abandons the
+  browser flow. Instead `Command::SaveCredentials` → `Engine::begin_setup` (sync:
+  persist creds, clear token cache if changed, emit "Connecting…") stores the
+  authorize+validate work as a `pending_setup` future (owning *cloned* copies of
+  the authorizer + config, so it borrows nothing from the engine). A dedicated
+  `select!` arm polls it via `poll_pending_setup` and applies the result with
+  `Engine::finish_setup` on completion. `Command::CancelSetup` (sent by the setup
+  screen's Cancel, `app.rs`) aborts by **dropping** the future — Rust cancels
+  futures on drop, tearing down yup-oauth2's localhost listener + browser flow.
+  This is why `Authorizer` must be `Clone` (both `GoogleAuthorizer` and the test
+  `FakeAuthorizer` derive it). The returning-user startup authorize
+  (`run_loop`, before the loop) is *intentionally* still inline/blocking — its
+  token is cached so no browser opens; don't "fix" it by mistake.
+
 - **Both tokio runtimes are deliberately capped at 2 worker threads.** The
   engine runtime (`lib.rs`, `.worker_threads(2)`) and the iced executor
   (`app.rs::UiExecutor`, wired via `.executor::<UiExecutor>()` in `lib.rs`).
