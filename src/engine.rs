@@ -235,8 +235,11 @@ impl<A: Authorizer> Engine<A> {
                 }
             },
         };
-        if path.exists() {
-            if let Err(e) = std::fs::remove_file(&path) {
+        // Just try the remove; a missing file is the expected case (fresh
+        // install / already cleared), so don't warn on NotFound and don't bother
+        // with a racy exists() pre-check.
+        if let Err(e) = std::fs::remove_file(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
                 warn!("could not clear token cache {}: {e:#}", path.display());
             }
         }
